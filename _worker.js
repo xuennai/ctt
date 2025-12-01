@@ -1,1285 +1,1553 @@
+/**
+ * Part 1: Infrastructure, Config & Helpers
+ */
+
+// --- 1. Global Variables & Config ---
 let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
+let CTX;
+let WORKER_URL;
 
 let lastCleanupTime = 0;
-const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
+const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; 
 let isInitialized = false;
+
+// Caches
 const processedMessages = new Set();
 const processedCallbacks = new Set();
-
+const mediaGroupCache = new Map();
 const topicCreationLocks = new Map();
+const settingsCache = new Map();
 
-const settingsCache = new Map([
-  ['verification_enabled', null],
-  ['user_raw_enabled', null]
-]);
-
+// --- 2. LRU Cache Class ---
 class LRUCache {
-  constructor(maxSize) {
-    this.maxSize = maxSize;
-    this.cache = new Map();
-  }
-  get(key) {
-    const value = this.cache.get(key);
-    if (value !== undefined) {
-      this.cache.delete(key);
-      this.cache.set(key, value);
+    constructor(maxSize) {
+        this.maxSize = maxSize;
+        this.cache = new Map();
     }
-    return value;
-  }
-  set(key, value) {
-    if (this.cache.size >= this.maxSize) {
-      const firstKey = this.cache.keys().next().value;
-      this.cache.delete(firstKey);
+    get(key) {
+        const value = this.cache.get(key);
+        if (value !== undefined) {
+            this.cache.delete(key);
+            this.cache.set(key, value);
+        }
+        return value;
     }
-    this.cache.set(key, value);
-  }
-  clear() {
-    this.cache.clear();
-  }
+    set(key, value) {
+        if (this.cache.size >= this.maxSize) {
+            this.cache.delete(this.cache.keys().next().value);
+        }
+        this.cache.set(key, value);
+    }
+    delete(key) { return this.cache.delete(key); }
+    clear() { this.cache.clear(); }
 }
 
+// Instance Caches
 const userInfoCache = new LRUCache(1000);
 const topicIdCache = new LRUCache(1000);
 const userStateCache = new LRUCache(1000);
 const messageRateCache = new LRUCache(1000);
 
-export default {
-  async fetch(request, env) {
-    BOT_TOKEN = env.BOT_TOKEN_ENV || null;
-    GROUP_ID = env.GROUP_ID_ENV || null;
-    MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
-
-    if (!env.D1) {
-      return new Response('Server configuration error: D1 database is not bound', { status: 500 });
+// --- 3. Database Helper (Reduces boilerplate) ---
+const DB = {
+    async get(d1, sql, params = []) {
+        return await d1.prepare(sql).bind(...params).first();
+    },
+    async run(d1, sql, params = []) {
+        return await d1.prepare(sql).bind(...params).run();
+    },
+    async all(d1, sql, params = []) {
+        return await d1.prepare(sql).bind(...params).all();
+    },
+    async exec(d1, sql) {
+        return await d1.exec(sql);
+    },
+    async batch(d1, statements) {
+        return await d1.batch(statements);
     }
+};
 
-    if (!isInitialized) {
-      await initialize(env.D1, request);
-      isInitialized = true;
-    }
+// --- 4. API Client Wrapper ---
+async function telegramRequest(method, payload, retries = 3) {
+    const url = `https://api.telegram.org/bot${BOT_TOKEN}/${method}`;
+    const options = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    };
 
-    async function handleRequest(request) {
-      if (!BOT_TOKEN || !GROUP_ID) {
-        return new Response('Server configuration error: Missing required environment variables', { status: 500 });
-      }
-
-      const url = new URL(request.url);
-      if (url.pathname === '/webhook') {
+    for (let i = 0; i < retries; i++) {
         try {
-          const update = await request.json();
-          await handleUpdate(update);
-          return new Response('OK');
+            const response = await fetch(url, options);
+            if (response.ok) return await response.json();
+
+            // Handle 429 (Rate Limit)
+            if (response.status === 429) {
+                const retryAfter = parseInt(response.headers.get('Retry-After') || '5');
+                await new Promise(r => setTimeout(r, retryAfter * 1000));
+                continue;
+            }
+
+            // Client errors (4xx) should not be retried (except 429)
+            if (response.status >= 400 && response.status < 500) {
+                const errText = await response.text();
+                throw new Error(`Telegram API Error ${response.status}: ${errText}`);
+            }
+
+            throw new Error(`Server Error ${response.status}`);
         } catch (error) {
-          return new Response('Bad Request', { status: 400 });
+            if (error.message.includes('Telegram API Error')) throw error; // Don't retry client errors
+            if (i === retries - 1) throw error;
+            await new Promise(r => setTimeout(r, 1000 * Math.pow(2, i)));
         }
-      } else if (url.pathname === '/registerWebhook') {
-        return await registerWebhook(request);
-      } else if (url.pathname === '/unRegisterWebhook') {
-        return await unRegisterWebhook();
-      } else if (url.pathname === '/checkTables') {
-        await checkAndRepairTables(env.D1);
-        return new Response('Database tables checked and repaired', { status: 200 });
-      }
-      return new Response('Not Found', { status: 404 });
     }
+}
 
-    async function initialize(d1, request) {
-      await Promise.all([
-        checkAndRepairTables(d1),
-        autoRegisterWebhook(request),
-        checkBotPermissions(),
-        cleanExpiredVerificationCodes(d1)
-      ]);
-    }
+/**
+ * Part 2: Core Logic & Handlers
+ */
+export default {
+    async fetch(request, env, ctx) {
+        BOT_TOKEN = env.BOT_TOKEN_ENV;
+        GROUP_ID = env.GROUP_ID_ENV;
+        MAX_MESSAGES_PER_MINUTE = parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV || '40');
+        CTX = ctx;
 
-    async function autoRegisterWebhook(request) {
-      const webhookUrl = `${new URL(request.url).origin}/webhook`;
-      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: webhookUrl }),
-      });
-    }
-
-    async function checkBotPermissions() {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: GROUP_ID })
-      });
-      const data = await response.json();
-      if (!data.ok) {
-        throw new Error(`Failed to access group: ${data.description}`);
-      }
-
-      const memberResponse = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: GROUP_ID,
-          user_id: (await getBotId())
-        })
-      });
-      const memberData = await memberResponse.json();
-      if (!memberData.ok) {
-        throw new Error(`Failed to get bot member status: ${memberData.description}`);
-      }
-    }
-
-    async function getBotId() {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
-      });
-      const data = await response.json();
-      if (!data.ok) throw new Error(`Failed to get bot ID: ${data.description}`);
-      return data.result.id;
-    }
-
-    async function checkAndRepairTables(d1) {
-      const expectedTables = {
-        user_states: {
-          columns: {
-            chat_id: 'TEXT PRIMARY KEY',
-            is_blocked: 'BOOLEAN DEFAULT FALSE',
-            is_verified: 'BOOLEAN DEFAULT FALSE',
-            verified_expiry: 'INTEGER',
-            verification_code: 'TEXT',
-            code_expiry: 'INTEGER',
-            last_verification_message_id: 'TEXT',
-            is_first_verification: 'BOOLEAN DEFAULT TRUE',
-            is_rate_limited: 'BOOLEAN DEFAULT FALSE',
-            is_verifying: 'BOOLEAN DEFAULT FALSE'
-          }
-        },
-        message_rates: {
-          columns: {
-            chat_id: 'TEXT PRIMARY KEY',
-            message_count: 'INTEGER DEFAULT 0',
-            window_start: 'INTEGER',
-            start_count: 'INTEGER DEFAULT 0',
-            start_window_start: 'INTEGER'
-          }
-        },
-        chat_topic_mappings: {
-          columns: {
-            chat_id: 'TEXT PRIMARY KEY',
-            topic_id: 'TEXT NOT NULL'
-          }
-        },
-        settings: {
-          columns: {
-            key: 'TEXT PRIMARY KEY',
-            value: 'TEXT'
-          }
-        }
-      };
-
-      for (const [tableName, structure] of Object.entries(expectedTables)) {
-        const tableInfo = await d1.prepare(
-          `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`
-        ).bind(tableName).first();
-
-        if (!tableInfo) {
-          await createTable(d1, tableName, structure);
-          continue;
+        if (!env.D1 || !BOT_TOKEN || !GROUP_ID) {
+            return new Response('Config Error', { status: 500 });
         }
 
-        const columnsResult = await d1.prepare(
-          `PRAGMA table_info(${tableName})`
-        ).all();
+        if (!isInitialized) {
+            await initialize(env.D1);
+            isInitialized = true;
+        }
+
+        const url = new URL(request.url);
         
-        const currentColumns = new Map(
-          columnsResult.results.map(col => [col.name, {
-            type: col.type,
-            notnull: col.notnull,
-            dflt_value: col.dflt_value
-          }])
-        );
-
-        for (const [colName, colDef] of Object.entries(structure.columns)) {
-          if (!currentColumns.has(colName)) {
-            const columnParts = colDef.split(' ');
-            const addColumnSQL = `ALTER TABLE ${tableName} ADD COLUMN ${colName} ${columnParts.slice(1).join(' ')}`;
-            await d1.exec(addColumnSQL);
-          }
+        // 自动获取 Worker URL (从任何请求中提取 origin)
+        if (!WORKER_URL) {
+            WORKER_URL = url.origin;
         }
-
-        if (tableName === 'settings') {
-          await d1.exec('CREATE INDEX IF NOT EXISTS idx_settings_key ON settings (key)');
-        }
-      }
-
-      await Promise.all([
-        d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
-          .bind('verification_enabled', 'true').run(),
-        d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
-          .bind('user_raw_enabled', 'true').run()
-      ]);
-
-      settingsCache.set('verification_enabled', (await getSetting('verification_enabled', d1)) === 'true');
-      settingsCache.set('user_raw_enabled', (await getSetting('user_raw_enabled', d1)) === 'true');
-    }
-
-    async function createTable(d1, tableName, structure) {
-      const columnsDef = Object.entries(structure.columns)
-        .map(([name, def]) => `${name} ${def}`)
-        .join(', ');
-      const createSQL = `CREATE TABLE ${tableName} (${columnsDef})`;
-      await d1.exec(createSQL);
-    }
-
-    async function cleanExpiredVerificationCodes(d1) {
-      const now = Date.now();
-      if (now - lastCleanupTime < CLEANUP_INTERVAL) {
-        return;
-      }
-
-      const nowSeconds = Math.floor(now / 1000);
-      const expiredCodes = await d1.prepare(
-        'SELECT chat_id FROM user_states WHERE code_expiry IS NOT NULL AND code_expiry < ?'
-      ).bind(nowSeconds).all();
-
-      if (expiredCodes.results.length > 0) {
-        await d1.batch(
-          expiredCodes.results.map(({ chat_id }) =>
-            d1.prepare(
-              'UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?'
-            ).bind(chat_id)
-          )
-        );
-      }
-      lastCleanupTime = now;
-    }
-
-    async function handleUpdate(update) {
-      if (update.message) {
-        const messageId = update.message.message_id.toString();
-        const chatId = update.message.chat.id.toString();
-        const messageKey = `${chatId}:${messageId}`;
         
-        if (processedMessages.has(messageKey)) {
-          return;
+        if (url.pathname === '/webhook' && request.method === 'POST') {
+            try {
+                const update = await request.json();
+                ctx.waitUntil(handleUpdate(env, update));
+                return new Response('OK');
+            } catch (e) { return new Response('Bad Request', { status: 400 }); }
         }
-        processedMessages.add(messageKey);
         
-        if (processedMessages.size > 10000) {
-          processedMessages.clear();
+        // Verification Page Route (Mini App)
+        if (url.pathname === '/verify_page') {
+            const chatId = url.searchParams.get('chat_id');
+            const token = url.searchParams.get('token');
+            if (!chatId || !token) {
+                return new Response('Missing parameters', { status: 400 });
+            }
+            return renderVerifyPage(env, chatId, token);
         }
-
-        await onMessage(update.message);
-      } else if (update.callback_query) {
-        await onCallbackQuery(update.callback_query);
-      }
+        
+        // Verification Submit Route
+        if (url.pathname === '/verify_submit' && request.method === 'POST') {
+            return await handleVerifySubmit(env, request);
+        }
+        
+        // Simple routes
+        switch (url.pathname) {
+            case '/registerWebhook': return await registerWebhook(request);
+            case '/unRegisterWebhook': return await unRegisterWebhook();
+            case '/checkTables':
+                await checkAndRepairTables(env.D1);
+                return new Response('Tables checked', { status: 200 });
+            default: return new Response('Not Found', { status: 404 });
+        }
     }
+};
 
-    async function onMessage(message) {
-      const chatId = message.chat.id.toString();
-      const text = message.text || '';
-      const messageId = message.message_id;
+async function initialize(d1) {
+    // 首次启动时确保数据库表存在
+    await checkAndRepairTables(d1);
+    // 清理过期的验证码
+    await cleanExpiredVerificationCodes(d1);
+}
 
-      if (chatId === GROUP_ID) {
+async function handleUpdate(env, update) {
+    if (update.message) {
+        const key = `${update.message.chat.id}:${update.message.message_id}`;
+        if (processedMessages.has(key)) return;
+        processedMessages.add(key);
+        if (processedMessages.size > 5000) processedMessages.clear(); // Reduced size to save memory
+        await onMessage(env, update.message);
+    } else if (update.edited_message) {
+        await onEditedMessage(env, update.edited_message);
+    } else if (update.callback_query) {
+        await onCallbackQuery(env, update.callback_query);
+    }
+}
+
+async function onMessage(env, message) {
+    const chatId = message.chat.id.toString();
+    const text = message.text || message.caption || '';
+    const messageId = message.message_id;
+
+    // --- 1. Admin/Group Logic (群组侧逻辑) ---
+    if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
-        if (topicId) {
-          const privateChatId = await getPrivateChatId(topicId);
-          if (privateChatId && text === '/admin') {
-            await sendAdminPanel(chatId, topicId, privateChatId, messageId);
-            return;
-          }
-          if (privateChatId && text.startsWith('/reset_user')) {
-            await handleResetUser(chatId, topicId, text);
-            return;
-          }
-          if (privateChatId) {
-            await forwardMessageToPrivateChat(privateChatId, message);
-          }
-        }
-        return;
-      }
+        if (!topicId) return;
 
-      let userState = userStateCache.get(chatId);
-      if (userState === undefined) {
-        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
-          .bind(chatId)
-          .first();
-        if (!userState) {
-          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
-          await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying) VALUES (?, ?, ?, ?, ?)')
-            .bind(chatId, false, true, false, false)
-            .run();
-        }
-        userStateCache.set(chatId, userState);
-      }
-
-      if (userState.is_blocked) {
-        await sendMessageToUser(chatId, "您已被拉黑，无法发送消息。请联系管理员解除拉黑。");
-        return;
-      }
-
-      const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-
-      if (!verificationEnabled) {
-        // 验证码关闭时，所有用户都可以直接发送消息
-      } else {
-        const nowSeconds = Math.floor(Date.now() / 1000);
-        const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
-        const isFirstVerification = userState.is_first_verification;
-        const isRateLimited = await checkMessageRate(chatId);
-        const isVerifying = userState.is_verifying || false;
-
-        if (!isVerified || (isRateLimited && !isFirstVerification)) {
-          if (isVerifying) {
-            // 检查验证码是否已过期
-            const storedCode = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
-              .bind(chatId)
-              .first();
+        const privateChatId = await getPrivateChatId(env.D1, topicId);
+        
+        // Command: /delete (删除指令)
+        if (/^\/delete(@\w+)?$/i.test(text)) {
+            if (!privateChatId) return;
+            if (await guardRateLimit(env.D1, GROUP_ID, topicId, 'general')) return;
+            try { await deleteMessage(GROUP_ID, messageId); } catch (e) {}
             
-            const nowSeconds = Math.floor(Date.now() / 1000);
-            const isCodeExpired = !storedCode?.verification_code || !storedCode?.code_expiry || nowSeconds > storedCode.code_expiry;
-            
-            if (isCodeExpired) {
-              // 如果验证码已过期，重新发送验证码
-              await sendMessageToUser(chatId, '验证码已过期，正在为您发送新的验证码...');
-              await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
-                .bind(chatId)
-                .run();
-              userStateCache.set(chatId, { ...userState, verification_code: null, code_expiry: null, is_verifying: false });
-              
-              // 删除旧的验证消息（如果存在）
-              try {
-                const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
-                  .bind(chatId)
-                  .first();
-                
-                if (lastVerification?.last_verification_message_id) {
-                  try {
-                    await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                        chat_id: chatId,
-                        message_id: lastVerification.last_verification_message_id
-                      })
-                    });
-                  } catch (deleteError) {
-                    console.log(`删除旧验证消息失败: ${deleteError.message}`);
-                    // 删除失败仍继续处理
-                  }
-                  
-                  await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
-                    .bind(chatId)
-                    .run();
-                }
-              } catch (error) {
-                console.log(`查询旧验证消息失败: ${error.message}`);
-                // 即使出错也继续处理
-              }
-              
-              // 立即发送新的验证码
-              try {
-                await handleVerification(chatId, 0);
-              } catch (verificationError) {
-                console.error(`发送新验证码失败: ${verificationError.message}`);
-                // 如果发送验证码失败，则再次尝试
-                setTimeout(async () => {
-                  try {
-                    await handleVerification(chatId, 0);
-                  } catch (retryError) {
-                    console.error(`重试发送验证码仍失败: ${retryError.message}`);
-                    await sendMessageToUser(chatId, '发送验证码失败，请发送任意消息重试');
-                  }
-                }, 1000);
-              }
-              return;
+            let targetGroupMsgId = null;
+            // 如果是对某条消息回复 /delete
+            if (message.reply_to_message && !message.reply_to_message.forum_topic_created) {
+                targetGroupMsgId = message.reply_to_message.message_id.toString();
             } else {
-              await sendMessageToUser(chatId, `请完成验证后发送消息"${text || '您的具体信息'}"。`);
+                // 否则，自动查找最后一条由 Admin 发送的消息
+                const lastAdminMsg = await DB.get(env.D1, 'SELECT group_message_id FROM message_mappings WHERE private_chat_id = ? AND sender_type = ? ORDER BY created_at DESC LIMIT 1', [privateChatId, 'admin']);
+                if (lastAdminMsg) targetGroupMsgId = lastAdminMsg.group_message_id;
+            }
+
+            if (targetGroupMsgId) {
+                // 执行双向删除
+                await handleSyncedDelete(env.D1, targetGroupMsgId, null); 
+                // 添加删除成功的提示
+                // await sendTempMessage(chatId, topicId, "🗑 消息已删除。");
+            } else {
+                await sendTempMessage(chatId, topicId, "⚠️ 未找到可删除的关联消息。");
             }
             return;
-          }
-          await sendMessageToUser(chatId, `请完成验证后发送消息"${text || '您的具体信息'}"。`);
-          await handleVerification(chatId, messageId);
-          return;
-        }
-      }
-
-      if (text === '/start') {
-        if (await checkStartCommandRate(chatId)) {
-          await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
-          return;
         }
 
-        const successMessage = await getVerificationSuccessMessage();
-        await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
-        const userInfo = await getUserInfo(chatId);
-        await ensureUserTopic(chatId, userInfo);
+        // Command: /wipe (批量撤回)
+        if (privateChatId && /^\/wipe(@\w+)?(\s+\d+)?$/i.test(text)) {
+            if (await guardRateLimit(env.D1, GROUP_ID, topicId, 'wipe')) return;
+            const count = Math.min(Math.max(parseInt(text.split(/\s+/)[1] || '3'), 1), 50);
+            await handleBatchDelete(env.D1, privateChatId, count, 'admin');
+            try { await deleteMessage(chatId, messageId); } catch (e) {}
+            await sendTempMessage(chatId, topicId, `🗑 已撤回最近 ${count} 条消息。`);
+            return;
+        }
+
+        // Command: /admin (管理面板)
+        if (privateChatId && /^\/admin(@\w+)?$/i.test(text)) {
+            if (await guardRateLimit(env.D1, GROUP_ID, topicId, 'general', true)) return;
+            await deleteMessage(chatId, messageId);
+            await sendAdminPanel(env.D1, chatId, topicId, privateChatId, messageId, false);
+            return;
+        }
+
+        // Normal Reply (Forward to User) (普通回复转发)
+        if (privateChatId) {
+            // Check Block/Verification status
+            const userState = await getUserState(env.D1, privateChatId);
+            
+            if (userState.is_blocked) {
+                await sendTempMessage(chatId, topicId, "🚫 发送失败：该用户已被拉黑。");
+                return;
+            }
+            const verifyEnabled = (await getSetting(env.D1, 'verification_enabled')) === 'true';
+            if (verifyEnabled && !userState.is_verified) {
+                await sendTempMessage(chatId, topicId, "⏳ 发送失败：用户未通过验证。");
+                return;
+            }
+
+            const sentMsgId = await forwardMessageToPrivateChat(privateChatId, message);
+            if (sentMsgId) await saveMessageMapping(env.D1, messageId.toString(), privateChatId, sentMsgId.toString(), 'admin');
+        }
         return;
-      }
-
-      const userInfo = await getUserInfo(chatId);
-      if (!userInfo) {
-        await sendMessageToUser(chatId, "无法获取用户信息，请稍后再试或联系管理员。");
-        return;
-      }
-
-      let topicId = await ensureUserTopic(chatId, userInfo);
-      if (!topicId) {
-        await sendMessageToUser(chatId, "无法创建话题，请稍后再试或联系管理员。");
-        return;
-      }
-
-      const isTopicValid = await validateTopic(topicId);
-      if (!isTopicValid) {
-        await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(chatId).run();
-        topicIdCache.set(chatId, undefined);
-        topicId = await ensureUserTopic(chatId, userInfo);
-        if (!topicId) {
-          await sendMessageToUser(chatId, "无法重新创建话题，请稍后再试或联系管理员。");
-          return;
-        }
-      }
-
-      const userName = userInfo.username || `User_${chatId}`;
-      const nickname = userInfo.nickname || userName;
-
-      if (text) {
-        const formattedMessage = `${nickname}:\n${text}`;
-        await sendMessageToTopic(topicId, formattedMessage);
-      } else {
-        await copyMessageToTopic(topicId, message);
-      }
     }
 
-    async function validateTopic(topicId) {
-      try {
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            message_thread_id: topicId,
-            text: "您有新消息！",
-            disable_notification: true
-          })
-        });
-        const data = await response.json();
-        if (data.ok) {
-          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: GROUP_ID,
-              message_id: data.result.message_id
-            })
-          });
-          return true;
-        }
-        return false;
-      } catch (error) {
-        return false;
-      }
+    // --- 2. User/Private Logic (用户私聊逻辑) ---
+    // 强制从数据库刷新用户状态（不使用缓存），确保获取最新验证状态
+    userStateCache.delete(chatId);
+    const userState = await getUserState(env.D1, chatId);
+
+    // 被拉黑后给予提示
+    if (userState.is_blocked) {
+        await sendMessageToUser(chatId, "🚫 您已被拉黑，无法发送消息，请联系管理员。");
+        return; 
     }
 
-    async function ensureUserTopic(chatId, userInfo) {
-      let lock = topicCreationLocks.get(chatId);
-      if (!lock) {
-        lock = Promise.resolve();
-        topicCreationLocks.set(chatId, lock);
-      }
+    // --- Verification Logic ---
+    const verifyEnabled = (await getSetting(env.D1, 'verification_enabled')) === 'true';
+    console.log(`[Verify] chatId=${chatId}, verifyEnabled=${verifyEnabled}, userState=`, JSON.stringify(userState));
 
-      try {
-        await lock;
-
-        let topicId = await getExistingTopicId(chatId);
-        if (topicId) {
-          return topicId;
-        }
-
-        const newLock = (async () => {
-          const userName = userInfo.username || `User_${chatId}`;
-          const nickname = userInfo.nickname || userName;
-          topicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
-          await saveTopicId(chatId, topicId);
-          return topicId;
-        })();
-
-        topicCreationLocks.set(chatId, newLock);
-        return await newLock;
-      } finally {
-        if (topicCreationLocks.get(chatId) === lock) {
-          topicCreationLocks.delete(chatId);
-        }
-      }
-    }
-
-    async function handleResetUser(chatId, topicId, text) {
-      const senderId = chatId;
-      const isAdmin = await checkIfAdmin(senderId);
-      if (!isAdmin) {
-        await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
-        return;
-      }
-
-      const parts = text.split(' ');
-      if (parts.length !== 2) {
-        await sendMessageToTopic(topicId, '用法：/reset_user <chat_id>');
-        return;
-      }
-
-      const targetChatId = parts[1];
-      await env.D1.batch([
-        env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(targetChatId),
-        env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId),
-        env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(targetChatId)
-      ]);
-      userStateCache.set(targetChatId, undefined);
-      messageRateCache.set(targetChatId, undefined);
-      topicIdCache.set(targetChatId, undefined);
-      await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
-    }
-
-    async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
-      const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-      const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
-
-      const buttons = [
-        [
-          { text: '拉黑用户', callback_data: `block_${privateChatId}` },
-          { text: '解除拉黑', callback_data: `unblock_${privateChatId}` }
-        ],
-        [
-          { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
-          { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
-        ],
-        [
-          { text: userRawEnabled ? '关闭用户Raw' : '开启用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
-          { text: 'GitHub项目', url: 'https://github.com/iawooo/ctt' }
-        ],
-        [
-          { text: '删除用户', callback_data: `delete_user_${privateChatId}` }
-        ]
-      ];
-
-      const adminMessage = '管理员面板：请选择操作';
-      await Promise.all([
-        fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_thread_id: topicId,
-            text: adminMessage,
-            reply_markup: { inline_keyboard: buttons }
-          })
-        }),
-        fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: messageId
-          })
-        })
-      ]);
-    }
-
-    async function getVerificationSuccessMessage() {
-      const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
-      if (!userRawEnabled) return '验证成功！您现在可以与我聊天。';
-
-      const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/start.md');
-      if (!response.ok) return '验证成功！您现在可以与我聊天。';
-      const message = await response.text();
-      return message.trim() || '验证成功！您现在可以与我聊天。';
-    }
-
-    async function getNotificationContent() {
-      const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/notification.md');
-      if (!response.ok) return '';
-      const content = await response.text();
-      return content.trim() || '';
-    }
-
-    async function checkStartCommandRate(chatId) {
-      const now = Date.now();
-      const window = 5 * 60 * 1000;
-      const maxStartsPerWindow = 1;
-
-      let data = messageRateCache.get(chatId);
-      if (data === undefined) {
-        data = await env.D1.prepare('SELECT start_count, start_window_start FROM message_rates WHERE chat_id = ?')
-          .bind(chatId)
-          .first();
-        if (!data) {
-          data = { start_count: 0, start_window_start: now };
-          await env.D1.prepare('INSERT INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
-            .bind(chatId, data.start_count, data.start_window_start)
-            .run();
-        }
-        messageRateCache.set(chatId, data);
-      }
-
-      if (now - data.start_window_start > window) {
-        data.start_count = 1;
-        data.start_window_start = now;
-        await env.D1.prepare('UPDATE message_rates SET start_count = ?, start_window_start = ? WHERE chat_id = ?')
-          .bind(data.start_count, data.start_window_start, chatId)
-          .run();
-      } else {
-        data.start_count += 1;
-        await env.D1.prepare('UPDATE message_rates SET start_count = ? WHERE chat_id = ?')
-          .bind(data.start_count, chatId)
-          .run();
-      }
-
-      messageRateCache.set(chatId, data);
-      return data.start_count > maxStartsPerWindow;
-    }
-
-    async function checkMessageRate(chatId) {
-      const now = Date.now();
-      const window = 60 * 1000;
-
-      let data = messageRateCache.get(chatId);
-      if (data === undefined) {
-        data = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
-          .bind(chatId)
-          .first();
-        if (!data) {
-          data = { message_count: 0, window_start: now };
-          await env.D1.prepare('INSERT INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
-            .bind(chatId, data.message_count, data.window_start)
-            .run();
-        }
-        messageRateCache.set(chatId, data);
-      }
-
-      if (now - data.window_start > window) {
-        data.message_count = 1;
-        data.window_start = now;
-      } else {
-        data.message_count += 1;
-      }
-
-      messageRateCache.set(chatId, data);
-      await env.D1.prepare('UPDATE message_rates SET message_count = ?, window_start = ? WHERE chat_id = ?')
-        .bind(data.message_count, data.window_start, chatId)
-        .run();
-      return data.message_count > MAX_MESSAGES_PER_MINUTE;
-    }
-
-    async function getSetting(key, d1) {
-      const result = await d1.prepare('SELECT value FROM settings WHERE key = ?')
-        .bind(key)
-        .first();
-      return result?.value || null;
-    }
-
-    async function setSetting(key, value) {
-      await env.D1.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
-        .bind(key, value)
-        .run();
-      if (key === 'verification_enabled') {
-        settingsCache.set('verification_enabled', value === 'true');
-        if (value === 'false') {
-          const nowSeconds = Math.floor(Date.now() / 1000);
-          const verifiedExpiry = nowSeconds + 3600 * 24;
-          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, is_verifying = ?, verification_code = NULL, code_expiry = NULL, is_first_verification = ? WHERE chat_id NOT IN (SELECT chat_id FROM user_states WHERE is_blocked = TRUE)')
-            .bind(true, verifiedExpiry, false, false)
-            .run();
-          userStateCache.clear();
-        }
-      } else if (key === 'user_raw_enabled') {
-        settingsCache.set('user_raw_enabled', value === 'true');
-      }
-    }
-
-    async function onCallbackQuery(callbackQuery) {
-      const chatId = callbackQuery.message.chat.id.toString();
-      const topicId = callbackQuery.message.message_thread_id;
-      const data = callbackQuery.data;
-      const messageId = callbackQuery.message.message_id;
-      const callbackKey = `${chatId}:${callbackQuery.id}`;
-
-      if (processedCallbacks.has(callbackKey)) {
-        return;
-      }
-      processedCallbacks.add(callbackKey);
-
-      const parts = data.split('_');
-      let action;
-      let privateChatId;
-
-      if (data.startsWith('verify_')) {
-        action = 'verify';
-        privateChatId = parts[1];
-      } else if (data.startsWith('toggle_verification_')) {
-        action = 'toggle_verification';
-        privateChatId = parts.slice(2).join('_');
-      } else if (data.startsWith('toggle_user_raw_')) {
-        action = 'toggle_user_raw';
-        privateChatId = parts.slice(3).join('_');
-      } else if (data.startsWith('check_blocklist_')) {
-        action = 'check_blocklist';
-        privateChatId = parts.slice(2).join('_');
-      } else if (data.startsWith('block_')) {
-        action = 'block';
-        privateChatId = parts.slice(1).join('_');
-      } else if (data.startsWith('unblock_')) {
-        action = 'unblock';
-        privateChatId = parts.slice(1).join('_');
-      } else if (data.startsWith('delete_user_')) {
-        action = 'delete_user';
-        privateChatId = parts.slice(2).join('_');
-      } else {
-        action = data;
-        privateChatId = '';
-      }
-
-      if (action === 'verify') {
-        const [, userChatId, selectedAnswer, result] = data.split('_');
-        if (userChatId !== chatId) {
-          return;
-        }
-
-        let verificationState = userStateCache.get(chatId);
-        if (verificationState === undefined) {
-          verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
-            .bind(chatId)
-            .first();
-          if (!verificationState) {
-            verificationState = { verification_code: null, code_expiry: null, is_verifying: false };
-          }
-          userStateCache.set(chatId, verificationState);
-        }
-
-        const storedCode = verificationState.verification_code;
-        const codeExpiry = verificationState.code_expiry;
-        const nowSeconds = Math.floor(Date.now() / 1000);
-
-        if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
-          await sendMessageToUser(chatId, '验证码已过期，正在为您发送新的验证码...');
-          await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
-            .bind(chatId)
-            .run();
-          userStateCache.set(chatId, { ...verificationState, verification_code: null, code_expiry: null, is_verifying: false });
-          
-          // 删除旧的验证消息
-          try {
-            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chat_id: chatId,
-                message_id: messageId
-              })
-            });
-          } catch (error) {
-            console.log(`删除过期验证按钮失败: ${error.message}`);
-            // 即使删除失败也继续处理
-          }
-          
-          // 立即发送新的验证码
-          try {
-            await handleVerification(chatId, 0);
-          } catch (verificationError) {
-            console.error(`发送新验证码失败: ${verificationError.message}`);
-            // 如果发送验证码失败，则再次尝试
-            setTimeout(async () => {
-              try {
-                await handleVerification(chatId, 0);
-              } catch (retryError) {
-                console.error(`重试发送验证码仍失败: ${retryError.message}`);
-                await sendMessageToUser(chatId, '发送验证码失败，请发送任意消息重试');
-              }
-            }, 1000);
-          }
-          return;
-        }
-
-        if (result === 'correct') {
-          const verifiedExpiry = nowSeconds + 3600 * 24;
-          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
-            .bind(true, verifiedExpiry, false, false, chatId)
-            .run();
-          verificationState = await env.D1.prepare('SELECT is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, is_first_verification, is_verifying FROM user_states WHERE chat_id = ?')
-            .bind(chatId)
-            .first();
-          userStateCache.set(chatId, verificationState);
-
-          let rateData = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
-            .bind(chatId)
-            .first() || { message_count: 0, window_start: nowSeconds * 1000 };
-          rateData.message_count = 0;
-          rateData.window_start = nowSeconds * 1000;
-          messageRateCache.set(chatId, rateData);
-          await env.D1.prepare('UPDATE message_rates SET message_count = ?, window_start = ? WHERE chat_id = ?')
-            .bind(0, nowSeconds * 1000, chatId)
-            .run();
-
-          const successMessage = await getVerificationSuccessMessage();
-          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
-          const userInfo = await getUserInfo(chatId);
-          await ensureUserTopic(chatId, userInfo);
+    if (verifyEnabled) {
+        const now = Math.floor(Date.now() / 1000);
+        const isVerifiedValid = userState.is_verified && (!userState.verified_expiry || now < userState.verified_expiry);
+        console.log(`[Verify] now=${now}, isVerifiedValid=${isVerifiedValid}, is_verified=${userState.is_verified}, verified_expiry=${userState.verified_expiry}`);
+        
+        if (isVerifiedValid) {
+            // 用户状态正常，什么都不做，让代码继续往下走去转发消息
+            console.log(`[Verify] User verified, proceeding to forward message`);
         } else {
-          await sendMessageToUser(chatId, '验证失败，请重新尝试。');
-          await handleVerification(chatId, messageId);
+            // 检查验证码格式：新 Token 格式为 "chatId_timestamp_random"，旧数学答案是纯数字
+            const isNewTokenFormat = userState.verification_code && userState.verification_code.includes('_');
+            
+            // 如果有旧格式数据（旧验证码或无效的 code_expiry），清理它们
+            const hasOldData = (userState.verification_code && !isNewTokenFormat) ||
+                               (userState.code_expiry && !userState.verification_code) ||
+                               (userState.code_expiry && userState.code_expiry > now + 86400); // 超过24小时的过期时间肯定是旧数据
+            
+            if (hasOldData) {
+                console.log(`[Verify] Old data detected, clearing: code=${userState.verification_code}, expiry=${userState.code_expiry}`);
+                userState.verification_code = null;
+                userState.code_expiry = null;
+                userState.is_verifying = false;
+                userStateCache.set(chatId, userState);
+                await DB.run(env.D1, 'UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?', [chatId]);
+                // 清理后继续往下走，发送新的验证
+            }
+            
+            // 条件：处于惩罚冷却期内（有 code_expiry 但没有 verification_code，且 code_expiry 在合理范围内）
+            if (userState.code_expiry && now < userState.code_expiry && !userState.verification_code) {
+                const remainingSeconds = userState.code_expiry - now;
+                // 冷却期最多 5 分钟，超过的话说明是旧数据
+                if (remainingSeconds <= 300) {
+                    const waitText = remainingSeconds > 60 ? `${Math.ceil(remainingSeconds / 60)} 分钟` : `${remainingSeconds} 秒`;
+                    console.log(`[Verify] User in cooldown, remaining=${waitText}`);
+                    await sendMessageToUser(chatId, `⏳ 请等待 ${waitText} 后再试。`);
+                    return;
+                }
+            }
+
+            // 条件：有验证码正在验证中（新格式）
+            if (userState.verification_code && userState.is_verifying && isNewTokenFormat) {
+                // 检查 Token 是否过期
+                if (userState.code_expiry && now < userState.code_expiry) {
+                    const remaining = userState.code_expiry - now;
+                    const remainingText = remaining > 60 ? `${Math.ceil(remaining / 60)} 分钟` : `${remaining} 秒`;
+                    console.log(`[Verify] User already in verification process with valid token`);
+                    await sendMessageToUser(chatId, `👆 请点击上方按钮完成验证（剩余 ${remainingText}）`);
+                    return; // 阻断消息
+                }
+                
+                // Token 已过期 - 进入惩罚冷却期
+                console.log(`[Verify] Token expired, entering cooldown period`);
+                
+                // 增加验证失败次数
+                const attempts = (userState.verification_attempts || 0) + 1;
+                // 惩罚时间：首次 30 秒，之后每次翻倍，最多 5 分钟
+                const cooldownSeconds = Math.min(30 * Math.pow(2, attempts - 1), 300);
+                const cooldownExpiry = now + cooldownSeconds;
+                
+                // 更新状态：清除验证码，设置冷却期
+                userState.verification_code = null;
+                userState.is_verifying = false;
+                userState.code_expiry = cooldownExpiry;
+                userState.verification_attempts = attempts;
+                userStateCache.set(chatId, userState);
+                
+                await DB.run(env.D1,
+                    'UPDATE user_states SET verification_code = NULL, is_verifying = FALSE, code_expiry = ?, verification_attempts = ? WHERE chat_id = ?',
+                    [cooldownExpiry, attempts, chatId]);
+                
+                await sendMessageToUser(chatId, `⏰ 验证超时！请等待 ${cooldownSeconds} 秒后重试。`);
+                return;
+            }
+
+            const prompt = userState.is_first_verification
+                ? "👋 初次对话请先完成人机验证，"
+                : "⚠️ 验证过期或检测到异常，请重新验证，";
+            
+            console.log(`[Verify] Sending verification to user, prompt=${prompt}`);
+            await handleVerification(env.D1, chatId, null, prompt);
+            return;
         }
-
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: messageId
-          })
-        });
-      } else {
-        const senderId = callbackQuery.from.id.toString();
-        const isAdmin = await checkIfAdmin(senderId);
-        if (!isAdmin) {
-          await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
-          await sendAdminPanel(chatId, topicId, privateChatId, messageId);
-          return;
-        }
-
-        if (action === 'block') {
-          let state = userStateCache.get(privateChatId);
-          if (state === undefined) {
-            state = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
-              .bind(privateChatId)
-              .first() || { is_blocked: false };
-          }
-          state.is_blocked = true;
-          userStateCache.set(privateChatId, state);
-          await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
-            .bind(privateChatId, true)
-            .run();
-          await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
-        } else if (action === 'unblock') {
-          let state = userStateCache.get(privateChatId);
-          if (state === undefined) {
-            state = await env.D1.prepare('SELECT is_blocked, is_first_verification FROM user_states WHERE chat_id = ?')
-              .bind(privateChatId)
-              .first() || { is_blocked: false, is_first_verification: true };
-          }
-          state.is_blocked = false;
-          state.is_first_verification = true;
-          userStateCache.set(privateChatId, state);
-          await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification) VALUES (?, ?, ?)')
-            .bind(privateChatId, false, true)
-            .run();
-          await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
-        } else if (action === 'toggle_verification') {
-          const currentState = (await getSetting('verification_enabled', env.D1)) === 'true';
-          const newState = !currentState;
-          await setSetting('verification_enabled', newState.toString());
-          await sendMessageToTopic(topicId, `验证码功能已${newState ? '开启' : '关闭'}。`);
-        } else if (action === 'check_blocklist') {
-          const blockedUsers = await env.D1.prepare('SELECT chat_id FROM user_states WHERE is_blocked = ?')
-            .bind(true)
-            .all();
-          const blockList = blockedUsers.results.length > 0 
-            ? blockedUsers.results.map(row => row.chat_id).join('\n')
-            : '当前没有被拉黑的用户。';
-          await sendMessageToTopic(topicId, `黑名单列表：\n${blockList}`);
-        } else if (action === 'toggle_user_raw') {
-          const currentState = (await getSetting('user_raw_enabled', env.D1)) === 'true';
-          const newState = !currentState;
-          await setSetting('user_raw_enabled', newState.toString());
-          await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
-        } else if (action === 'delete_user') {
-          userStateCache.set(privateChatId, undefined);
-          messageRateCache.set(privateChatId, undefined);
-          topicIdCache.set(privateChatId, undefined);
-          await env.D1.batch([
-            env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(privateChatId),
-            env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(privateChatId),
-            env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(privateChatId)
-          ]);
-          await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录和话题映射已删除，用户需重新发起会话。`);
-        } else {
-          await sendMessageToTopic(topicId, `未知操作：${action}`);
-        }
-
-        await sendAdminPanel(chatId, topicId, privateChatId, messageId);
-      }
-
-      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          callback_query_id: callbackQuery.id
-        })
-      });
     }
 
-    async function handleVerification(chatId, messageId) {
-      try {
-        let userState = userStateCache.get(chatId);
-        if (userState === undefined) {
-          userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
-            .bind(chatId)
-            .first();
-          if (!userState) {
-            userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
-          }
-          userStateCache.set(chatId, userState);
+    // User Commands
+    if (/^\/start(@\w+)?$/i.test(text)) {
+        if (await guardRateLimit(env.D1, chatId, null, 'start')) return;
+        await sendMessageToUser(chatId, `你好，欢迎使用私聊机器人！`, { disable_web_page_preview: true });
+        const info = await getUserInfo(chatId);
+        await ensureUserTopic(env.D1, chatId, info);
+        return;
+    }
+
+    // User Self-Delete (/delete)
+    if (/^\/delete(@\w+)?$/i.test(text)) {
+        if (await guardRateLimit(env.D1, chatId, null, 'general')) return;
+        let targetGroupMsgId = null;
+        if (message.reply_to_message) {
+            const mapping = await DB.get(env.D1, 'SELECT group_message_id FROM message_mappings WHERE private_chat_id = ? AND private_message_id = ?', [chatId, message.reply_to_message.message_id.toString()]);
+            if (mapping) targetGroupMsgId = mapping.group_message_id;
+        } else {
+            const lastUserMsg = await DB.get(env.D1, 'SELECT group_message_id FROM message_mappings WHERE private_chat_id = ? AND sender_type = ? ORDER BY created_at DESC LIMIT 1', [chatId, 'user']);
+            if (lastUserMsg) targetGroupMsgId = lastUserMsg.group_message_id;
         }
-
-        userState.verification_code = null;
-        userState.code_expiry = null;
-        userState.is_verifying = true;
-        userStateCache.set(chatId, userState);
-        await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = ? WHERE chat_id = ?')
-          .bind(true, chatId)
-          .run();
-
-        const lastVerification = userState.last_verification_message_id || (await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
-          .bind(chatId)
-          .first())?.last_verification_message_id;
-
-        if (lastVerification) {
-          try {
-            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chat_id: chatId,
-                message_id: lastVerification
-              })
-            });
-          } catch (deleteError) {
-            console.log(`删除上一条验证消息失败: ${deleteError.message}`);
-            // 继续处理，即使删除失败
-          }
-          
-          userState.last_verification_message_id = null;
-          userStateCache.set(chatId, userState);
-          await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
-            .bind(chatId)
-            .run();
+        
+        if (targetGroupMsgId) {
+            await handleSyncedDelete(env.D1, targetGroupMsgId, messageId, chatId); 
+            // 用户侧删除通常不需要额外提示“删除成功”，因为消息视觉上消失了
+            // 如果你需要提示，可以在这里加：await sendMessageToUser(chatId, "已删除");
+        } else {
+            await deleteMessage(chatId, messageId); // 仅删除指令
         }
+        return;
+    }
 
-        // 确保发送验证码
-        await sendVerification(chatId);
-      } catch (error) {
-        console.error(`处理验证过程失败: ${error.message}`);
-        // 重置用户状态以防卡住
+    // User Batch Delete (/wipe)
+    if (/^\/wipe(@\w+)?(\s+\d+)?$/i.test(text)) {
+        if (await guardRateLimit(env.D1, chatId, null, 'wipe')) return;
+        const count = Math.min(Math.max(parseInt(text.split(/\s+/)[1] || '3'), 1), 50);
+        await handleBatchDelete(env.D1, chatId, count, 'user');
+        try { await deleteMessage(chatId, messageId); } catch (e) {}
+        return;
+    }
+
+    // --- Forwarding Logic (转发核心) ---
+    const userInfo = await getUserInfo(chatId);
+    if (!userInfo) return;
+
+    let topicId;
+    try {
+        topicId = await ensureUserTopic(env.D1, chatId, userInfo);
+    } catch(e) {
+        await sendMessageToUser(chatId, "系统繁忙，无法创建话题。");
+        return;
+    }
+
+    if (message.media_group_id) {
+        await handleMediaGroupBuffer(env.D1, chatId, topicId, message, messageId);
+    } else {
+        await forwardUserMessageWithRetry(env.D1, chatId, topicId, message, userInfo, messageId);
+    }
+}
+
+// --- Media Group Handling ---
+async function handleMediaGroupBuffer(d1, chatId, topicId, message, originalMessageId) {
+    const groupId = message.media_group_id;
+    
+    if (!mediaGroupCache.has(groupId)) {
+        let resolveFunc;
+        const promise = new Promise(resolve => { resolveFunc = resolve; });
+        mediaGroupCache.set(groupId, { messages: [], timer: null, resolve: resolveFunc, promise: promise });
+    }
+
+    const groupData = mediaGroupCache.get(groupId);
+    groupData.messages.push(message);
+    if (groupData.timer) clearTimeout(groupData.timer);
+
+    groupData.timer = setTimeout(async () => {
+        const currentGroup = mediaGroupCache.get(groupId);
+        if (!currentGroup) return;
+        mediaGroupCache.delete(groupId);
+
+        // Sort by ID to match user sending order
+        const msgs = currentGroup.messages.sort((a, b) => a.message_id - b.message_id);
+        const msgIds = msgs.map(m => m.message_id);
+
         try {
-          await env.D1.prepare('UPDATE user_states SET is_verifying = FALSE WHERE chat_id = ?')
-            .bind(chatId)
-            .run();
-          let currentState = userStateCache.get(chatId);
-          if (currentState) {
-            currentState.is_verifying = false;
-            userStateCache.set(chatId, currentState);
-          }
-        } catch (resetError) {
-          console.error(`重置用户验证状态失败: ${resetError.message}`);
+            // Forward the whole album
+            const result = await telegramRequest('forwardMessages', {
+                chat_id: GROUP_ID,
+                from_chat_id: chatId,
+                message_ids: msgIds,
+                message_thread_id: topicId,
+                disable_notification: true
+            });
+
+            // Map EVERY forwarded message, not just the first one
+            if (result && result.ok && Array.isArray(result.result)) {
+                // The result array generally matches the order of input message_ids
+                for (let i = 0; i < result.result.length; i++) {
+                    const newMsg = result.result[i];
+                    const originalMsg = msgs[i]; // Corresponds to the sorted input
+                    
+                    if (newMsg && originalMsg) {
+                        await saveMessageMapping(d1, newMsg.message_id.toString(), chatId, originalMsg.message_id.toString(), 'user');
+                    }
+                }
+            }
+        } catch (e) {
+            console.error('Error forwarding media group:', e);
+        } finally {
+            currentGroup.resolve();
         }
-        throw error; // 向上传递错误以便调用方处理
-      }
-    }
+    }, 2000); // 2 seconds buffer
 
-    async function sendVerification(chatId) {
-      try {
-        const num1 = Math.floor(Math.random() * 10);
-        const num2 = Math.floor(Math.random() * 10);
-        const operation = Math.random() > 0.5 ? '+' : '-';
-        const correctResult = operation === '+' ? num1 + num2 : num1 - num2;
+    await groupData.promise;
+}
 
-        const options = new Set([correctResult]);
-        while (options.size < 4) {
-          const wrongResult = correctResult + Math.floor(Math.random() * 5) - 2;
-          if (wrongResult !== correctResult) options.add(wrongResult);
-        }
-        const optionArray = Array.from(options).sort(() => Math.random() - 0.5);
+/**
+ * Part 3: Callback Handling & Admin Logic
+ */
 
-        const buttons = optionArray.map(option => ({
-          text: `(${option})`,
-          callback_data: `verify_${chatId}_${option}_${option === correctResult ? 'correct' : 'wrong'}`
-        }));
+// --- 1. Callback Query Entry Point (Fixed with User Notification) ---
+async function onCallbackQuery(env, query) {
+    const data = query.data;
+    const chatId = query.message.chat.id.toString();
+    const messageId = query.message.message_id;
+    const callbackId = query.id;
 
-        const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
-        const nowSeconds = Math.floor(Date.now() / 1000);
-        const codeExpiry = nowSeconds + 300;
+    if (processedCallbacks.has(callbackId)) return;
+    processedCallbacks.add(callbackId);
+    if (processedCallbacks.size > 2000) processedCallbacks.clear();
 
-        let userState = userStateCache.get(chatId);
-        if (userState === undefined) {
-          userState = { verification_code: correctResult.toString(), code_expiry: codeExpiry, last_verification_message_id: null, is_verifying: true };
-        } else {
-          userState.verification_code = correctResult.toString();
-          userState.code_expiry = codeExpiry;
-          userState.last_verification_message_id = null;
-          userState.is_verifying = true;
-        }
-        userStateCache.set(chatId, userState);
+    // === A. 旧验证按钮已移除，Mini App 验证不使用 callback ===
 
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: question,
-            reply_markup: { inline_keyboard: [buttons] }
-          })
+    // === B. 管理员权限检查 ===
+    const senderId = query.from.id.toString();
+    const isAdmin = await checkIfAdmin(senderId);
+    if (!isAdmin) {
+        await telegramRequest('answerCallbackQuery', {
+            callback_query_id: callbackId,
+            text: '❌ 只有管理员可以使用此功能',
+            show_alert: true
         });
-        const data = await response.json();
-        if (data.ok) {
-          userState.last_verification_message_id = data.result.message_id.toString();
-          userStateCache.set(chatId, userState);
-          await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ?, is_verifying = ? WHERE chat_id = ?')
-            .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), true, chatId)
-            .run();
-        } else {
-          throw new Error(`Telegram API 返回错误: ${data.description || '未知错误'}`);
+        return;
+    }
+
+    // === C. 管理员操作路由 ===
+    let toastText = '';
+    let shouldRefreshPanel = true;
+
+    let action = data;
+    let param = '';
+    
+    const prefixes = [
+        'block_', 'unblock_', 
+        'toggle_verification_', 'check_blocklist_', 'toggle_user_raw_', 
+        'pre_del_keep_', 'pre_del_wipe_', 
+        'del_keep_', 'del_wipe_', 
+        'close_admin_panel_', 'back_admin_'
+    ];
+    
+    for (const prefix of prefixes) {
+        if (data.startsWith(prefix)) {
+            action = prefix.slice(0, -1); 
+            param = data.slice(prefix.length);
+            break;
         }
-      } catch (error) {
-        console.error(`发送验证码失败: ${error.message}`);
-        throw error; // 向上传递错误以便调用方处理
-      }
-    }
-
-    async function checkIfAdmin(userId) {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: GROUP_ID,
-          user_id: userId
-        })
-      });
-      const data = await response.json();
-      return data.ok && (data.result.status === 'administrator' || data.result.status === 'creator');
-    }
-
-    async function getUserInfo(chatId) {
-      let userInfo = userInfoCache.get(chatId);
-      if (userInfo !== undefined) {
-        return userInfo;
-      }
-
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId })
-      });
-      const data = await response.json();
-      if (!data.ok) {
-        userInfo = {
-          id: chatId,
-          username: `User_${chatId}`,
-          nickname: `User_${chatId}`
-        };
-      } else {
-        const result = data.result;
-        const nickname = result.first_name
-          ? `${result.first_name}${result.last_name ? ` ${result.last_name}` : ''}`.trim()
-          : result.username || `User_${chatId}`;
-        userInfo = {
-          id: result.id || chatId,
-          username: result.username || `User_${chatId}`,
-          nickname: nickname
-        };
-      }
-
-      userInfoCache.set(chatId, userInfo);
-      return userInfo;
-    }
-
-    async function getExistingTopicId(chatId) {
-      let topicId = topicIdCache.get(chatId);
-      if (topicId !== undefined) {
-        return topicId;
-      }
-
-      const result = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      topicId = result?.topic_id || null;
-      if (topicId) {
-        topicIdCache.set(chatId, topicId);
-      }
-      return topicId;
-    }
-
-    async function createForumTopic(topicName, userName, nickname, userId) {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: GROUP_ID, name: `${nickname}` })
-      });
-      const data = await response.json();
-      if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
-      const topicId = data.result.message_thread_id;
-
-      const now = new Date();
-      const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
-      const notificationContent = await getNotificationContent();
-      const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
-      const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
-      const messageId = messageResponse.result.message_id;
-      await pinMessage(topicId, messageId);
-
-      return topicId;
-    }
-
-    async function saveTopicId(chatId, topicId) {
-      await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-        .bind(chatId, topicId)
-        .run();
-      topicIdCache.set(chatId, topicId);
-    }
-
-    async function getPrivateChatId(topicId) {
-      for (const [chatId, tid] of topicIdCache.cache) if (tid === topicId) return chatId;
-      const mapping = await env.D1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?')
-        .bind(topicId)
-        .first();
-      return mapping?.chat_id || null;
-    }
-
-    async function sendMessageToTopic(topicId, text) {
-      if (!text.trim()) {
-        throw new Error('Message text is empty');
-      }
-
-      const requestBody = {
-        chat_id: GROUP_ID,
-        text: text,
-        message_thread_id: topicId
-      };
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-      });
-      const data = await response.json();
-      if (!data.ok) {
-        throw new Error(`Failed to send message to topic ${topicId}: ${data.description}`);
-      }
-      return data;
-    }
-
-    async function copyMessageToTopic(topicId, message) {
-      const requestBody = {
-        chat_id: GROUP_ID,
-        from_chat_id: message.chat.id,
-        message_id: message.message_id,
-        message_thread_id: topicId,
-        disable_notification: true
-      };
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-      });
-      const data = await response.json();
-      if (!data.ok) {
-        throw new Error(`Failed to copy message to topic ${topicId}: ${data.description}`);
-      }
-    }
-
-    async function pinMessage(topicId, messageId) {
-      const requestBody = {
-        chat_id: GROUP_ID,
-        message_id: messageId,
-        message_thread_id: topicId
-      };
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-      });
-      const data = await response.json();
-      if (!data.ok) {
-        throw new Error(`Failed to pin message: ${data.description}`);
-      }
-    }
-
-    async function forwardMessageToPrivateChat(privateChatId, message) {
-      const requestBody = {
-        chat_id: privateChatId,
-        from_chat_id: message.chat.id,
-        message_id: message.message_id,
-        disable_notification: true
-      };
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-      });
-      const data = await response.json();
-      if (!data.ok) {
-        throw new Error(`Failed to forward message to private chat: ${data.description}`);
-      }
-    }
-
-    async function sendMessageToUser(chatId, text) {
-      const requestBody = { chat_id: chatId, text: text };
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-      });
-      const data = await response.json();
-      if (!data.ok) {
-        throw new Error(`Failed to send message to user: ${data.description}`);
-      }
-    }
-
-    async function fetchWithRetry(url, options, retries = 3, backoff = 1000) {
-      for (let i = 0; i < retries; i++) {
-        try {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 5000);
-          const response = await fetch(url, { ...options, signal: controller.signal });
-          clearTimeout(timeoutId);
-
-          if (response.ok) {
-            return response;
-          }
-          if (response.status === 429) {
-            const retryAfter = response.headers.get('Retry-After') || 5;
-            const delay = parseInt(retryAfter) * 1000;
-            await new Promise(resolve => setTimeout(resolve, delay));
-            continue;
-          }
-          throw new Error(`Request failed with status ${response.status}: ${await response.text()}`);
-        } catch (error) {
-          if (i === retries - 1) throw error;
-          await new Promise(resolve => setTimeout(resolve, backoff * Math.pow(2, i)));
-        }
-      }
-      throw new Error(`Failed to fetch ${url} after ${retries} retries`);
-    }
-
-    async function registerWebhook(request) {
-      const webhookUrl = `${new URL(request.url).origin}/webhook`;
-      const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: webhookUrl })
-      }).then(r => r.json());
-      return new Response(response.ok ? 'Webhook set successfully' : JSON.stringify(response, null, 2));
-    }
-
-    async function unRegisterWebhook() {
-      const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: '' })
-      }).then(r => r.json());
-      return new Response(response.ok ? 'Webhook removed' : JSON.stringify(response, null, 2));
     }
 
     try {
-      return await handleRequest(request);
-    } catch (error) {
-      return new Response('Internal Server Error', { status: 500 });
+        switch (action) {
+            case 'close_admin_panel':
+                await deleteMessage(chatId, messageId);
+                toastText = '面板已关闭';
+                shouldRefreshPanel = false;
+                break;
+
+            case 'block':
+                await DB.run(env.D1, 'INSERT OR IGNORE INTO user_states (chat_id) VALUES (?)', [param]);
+                await DB.run(env.D1, 'UPDATE user_states SET is_blocked = TRUE WHERE chat_id = ?', [param]);
+                userStateCache.delete(param);
+                toastText = `用户 ${param} 已拉黑`;
+                break;
+
+            case 'unblock':
+                await DB.run(env.D1, 'UPDATE user_states SET is_blocked = FALSE, is_verified = FALSE, is_first_verification = TRUE WHERE chat_id = ?', [param]);
+                userStateCache.delete(param);
+                toastText = `用户 ${param} 已解除拉黑`;
+                break;
+
+            case 'toggle_verification':
+                const vState = await getSetting(env.D1, 'verification_enabled');
+                const vNew = vState === 'true' ? 'false' : 'true';
+                await setSetting(env.D1, 'verification_enabled', vNew);
+                toastText = `验证功能已${vNew === 'true' ? '开启' : '关闭'}`;
+                break;
+
+            case 'toggle_user_raw':
+                const rState = await getSetting(env.D1, 'user_raw_enabled');
+                const rNew = rState === 'true' ? 'false' : 'true';
+                await setSetting(env.D1, 'user_raw_enabled', rNew);
+                toastText = `Raw 链接已${rNew === 'true' ? '开启' : '关闭'}`;
+                break;
+
+            case 'check_blocklist':
+                const blocks = await DB.all(env.D1, 'SELECT chat_id FROM user_states WHERE is_blocked = TRUE');
+                const listText = blocks.results.length > 0 ? blocks.results.map(r => r.chat_id).join('\n') : '无';
+                if (query.message.message_thread_id) {
+                    await sendMessageToTopic(query.message.message_thread_id, `🚫 黑名单列表：\n${listText}`);
+                } else {
+                    await telegramRequest('sendMessage', { chat_id: chatId, text: `🚫 黑名单列表：\n${listText}` });
+                }
+                toastText = '查询完成';
+                break;
+
+            // === 删除/重置 预确认 ===
+            case 'pre_del_keep':
+            case 'pre_del_wipe':
+                const isWipe = action === 'pre_del_wipe';
+                const warning = isWipe 
+                    ? `⚠️ <b>危险操作</b>\n确定要 <b>彻底删除</b> 用户 <code>${param}</code> 吗？\n这将删除数据库记录并关闭 Topic。`
+                    : `⚠️ <b>重置确认</b>\n确定要重置用户 <code>${param}</code> 的状态吗？\nTopic 将保留。`;
+                const confirmBtn = isWipe ? `del_wipe_${param}` : `del_keep_${param}`;
+                
+                await telegramRequest('editMessageText', {
+                    chat_id: chatId, message_id: messageId, text: warning, parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[
+                        { text: '⚠️ 确认执行', callback_data: confirmBtn },
+                        { text: '🔙 返回', callback_data: `back_admin_${param}` }
+                    ]]}
+                });
+                shouldRefreshPanel = false;
+                break;
+
+            // === 删除/重置 执行 ===
+            case 'del_keep':
+            case 'del_wipe':
+                // 在执行删除前，先通知用户
+                try {
+                    await sendMessageToUser(param, "⚠️ 您的会话记录已被管理员重置/删除，如需继续聊天，请重新发送消息或输入 /start。");
+                } catch (e) {
+                    console.warn(`Failed to notify user ${param}:`, e);
+                }
+
+                await performUserDeletion(env, param, action === 'del_wipe');
+                await deleteMessage(chatId, messageId); 
+                
+                if (action === 'del_keep' && query.message.message_thread_id) {
+                     await sendMessageToTopic(query.message.message_thread_id, `用户 ${param} 状态已重置。`);
+                }
+                
+                toastText = action === 'del_wipe' ? '用户已彻底删除' : '用户已重置';
+                shouldRefreshPanel = false;
+                break;
+
+            case 'back_admin':
+                break;
+
+            default:
+                console.log(`Unknown action: ${action}`);
+                toastText = `未知操作: ${action}`;
+        }
+
+        if (shouldRefreshPanel) {
+            await sendAdminPanel(env.D1, chatId, query.message.message_thread_id, param, messageId, true);
+        }
+
+        await telegramRequest('answerCallbackQuery', {
+            callback_query_id: callbackId,
+            text: toastText,
+            show_alert: false
+        });
+
+    } catch (e) {
+        console.error('Callback Error:', e);
+        await telegramRequest('answerCallbackQuery', { callback_query_id: callbackId, text: '操作失败: ' + e.message, show_alert: true });
     }
-  }
-};
+}
+
+// --- 2. Admin Panel UI ---
+async function sendAdminPanel(d1, chatId, topicId, privateChatId, messageId, isEdit) {
+    const [vEnabled, rEnabled] = await Promise.all([
+        getSetting(d1, 'verification_enabled'),
+        getSetting(d1, 'user_raw_enabled')
+    ]);
+
+    // 状态可视化
+    const vIcon = vEnabled === 'true' ? '✅' : '🔴';
+    const rIcon = rEnabled === 'true' ? '✅' : '🔴';
+
+    const buttons = [
+        [
+            { text: '🚫 拉黑用户', callback_data: `block_${privateChatId}` },
+            { text: '🟢 解除拉黑', callback_data: `unblock_${privateChatId}` }
+        ],
+        [
+            { text: `${vIcon} 验证功能`, callback_data: `toggle_verification_${privateChatId}` },
+            { text: '📜 查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
+        ],
+        [
+            { text: `${rIcon} Raw 链接`, callback_data: `toggle_user_raw_${privateChatId}` },
+            { text: '🔗 GitHub', url: 'https://github.com/xuennai/ctt' }
+        ],
+        [
+            { text: '🔄 重置用户', callback_data: `pre_del_keep_${privateChatId}` },
+            { text: '🔥 彻底删除', callback_data: `pre_del_wipe_${privateChatId}` }
+        ],
+        [
+            { text: '❌ 关闭面板', callback_data: `close_admin_panel_${privateChatId}` }
+        ]
+    ];
+
+    const text = `🔧 <b>管理员控制台</b>`;
+    const payload = {
+        chat_id: chatId,
+        text: text,
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: buttons }
+    };
+
+    if (isEdit) {
+        payload.message_id = messageId;
+        try { await telegramRequest('editMessageText', payload); } catch (e) {}
+    } else {
+        payload.message_thread_id = topicId;
+        await telegramRequest('sendMessage', payload);
+        // 如果是新发送的面板，把原来的 /admin 命令删掉保持整洁
+        if (messageId) await deleteMessage(chatId, messageId);
+    }
+}
+
+// --- 3. Verification Specific Logic (已迁移到 Mini App + Turnstile) ---
+// 旧的 handleVerificationCallback 已移除，验证现在通过 /verify_page 和 /verify_submit 路由处理
+
+/**
+ * Part 4: Topic Management & Forwarding Core
+ */
+
+// --- 1. Topic Creation with Locking ---
+async function ensureUserTopic(d1, chatId, userInfo) {
+    let lock = topicCreationLocks.get(chatId);
+    if (lock) {
+        await lock; 
+        const cached = await getExistingTopicId(d1, chatId);
+        if (cached) return cached;
+    }
+
+    const createLogic = async () => {
+        try {
+            let existing = await getExistingTopicId(d1, chatId);
+            if (existing) return existing;
+
+            const name = userInfo.nickname || userInfo.username || `User ${chatId}`;
+            // 截断名称防止报错
+            const res = await telegramRequest('createForumTopic', {
+                chat_id: GROUP_ID,
+                name: name.substring(0, 127) 
+            });
+
+            if (!res.ok) throw new Error('Create topic failed');
+            const topicId = res.result.message_thread_id;
+
+            // 发送置顶信息（包含 Notification）
+            await sendTopicIntroMessage(topicId, userInfo, chatId);
+
+            await DB.run(d1, 'INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)', [chatId, topicId]);
+            topicIdCache.set(chatId, topicId);
+            
+            return topicId;
+        } catch (e) {
+            console.error(`Create topic error for ${chatId}:`, e);
+            throw e;
+        }
+    };
+
+    const newLock = createLogic();
+    topicCreationLocks.set(chatId, newLock);
+    try {
+        return await newLock;
+    } finally {
+        if (topicCreationLocks.get(chatId) === newLock) {
+            topicCreationLocks.delete(chatId);
+        }
+    }
+}
+
+// --- 2. Topic Intro Message (with Notification) ---
+async function sendTopicIntroMessage(topicId, userInfo, userId) {
+    const time = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+    
+    // 获取通知内容
+    const notificationContent = await getNotificationContent();
+    
+    const text = 
+`<b>🛡 用户信息卡片</b>
+昵称: ${userInfo.nickname}
+用户名: ${userInfo.username ? '@'+userInfo.username : '无'}
+ID: <code>${userId}</code>
+时间: ${time}
+
+${notificationContent}`;
+
+    const res = await sendMessageToTopic(topicId, text, { parse_mode: 'HTML' });
+    
+    // 如果 HTML 解析失败（通常因为通知内容里有特殊字符），降级为纯文本发送
+    if (!res || !res.ok) {
+         const plainText = `🛡 用户信息卡片\n昵称: ${userInfo.nickname}\nID: ${userId}\n时间: ${time}\n\n${notificationContent}`;
+         await sendMessageToTopic(topicId, plainText);
+    } else if (res.result) {
+        // 置顶消息
+        await telegramRequest('pinChatMessage', {
+            chat_id: GROUP_ID,
+            message_thread_id: topicId,
+            message_id: res.result.message_id
+        });
+    }
+}
+
+// 缓存 TTL 和远程内容变量
+const CACHE_TTL = 3600 * 1000; // 1小时缓存
+let cachedNotification = null;
+let cachedNotificationTime = 0;
+
+async function getNotificationContent() {
+    const now = Date.now();
+    if (cachedNotification !== null && (now - cachedNotificationTime) < CACHE_TTL) {
+        return cachedNotification;
+    }
+    
+    try {
+        const response = await fetch('https://raw.githubusercontent.com/xuennai/ctt/refs/heads/main/CFTeleTrans/notification.md');
+        if (!response.ok) {
+            cachedNotification = '';
+            cachedNotificationTime = now;
+            return '';
+        }
+        cachedNotification = (await response.text()).trim();
+        cachedNotificationTime = now;
+        return cachedNotification;
+    } catch (e) {
+        console.warn('Failed to fetch notification:', e);
+        cachedNotification = '';
+        cachedNotificationTime = now;
+        return '';
+    }
+}
+
+// --- 3. Robust Forwarding (User -> Group) ---
+async function forwardUserMessageWithRetry(d1, chatId, topicId, message, userInfo, originalMessageId) {
+    try {
+        await performForward(d1, chatId, topicId, message, originalMessageId);
+    } catch (error) {
+        const errStr = error.toString().toLowerCase();
+        if (errStr.includes('thread not found') || errStr.includes('topic not found') || errStr.includes('thread is invalid')) {
+            console.log(`Topic invalid for ${chatId}, recreating...`);
+            
+            await DB.run(d1, 'DELETE FROM chat_topic_mappings WHERE chat_id = ?', [chatId]);
+            topicIdCache.delete(chatId);
+
+            const newTopicId = await ensureUserTopic(d1, chatId, userInfo);
+            if (newTopicId) {
+                await performForward(d1, chatId, newTopicId, message, originalMessageId);
+            }
+        } else {
+            throw error;
+        }
+    }
+}
+
+async function performForward(d1, chatId, topicId, message, originalMessageId) {
+    const res = await telegramRequest('forwardMessage', {
+        chat_id: GROUP_ID,
+        from_chat_id: chatId,
+        message_id: message.message_id,
+        message_thread_id: topicId
+    });
+
+    if (res.ok && res.result) {
+        await saveMessageMapping(d1, res.result.message_id.toString(), chatId, originalMessageId.toString(), 'user');
+    }
+}
+
+// --- 4. Forwarding (Group -> User) ---
+async function forwardMessageToPrivateChat(privateChatId, message) {
+    const res = await telegramRequest('copyMessage', {
+        chat_id: privateChatId,
+        from_chat_id: message.chat.id,
+        message_id: message.message_id
+    });
+    
+    if (res.ok && res.result) {
+        return res.result.message_id;
+    }
+    return null;
+}
+
+
+
+/**
+ * Part 5: Helpers, Rate Limiting & DB Maintenance
+ */
+
+// --- 1. Mapping Helpers ---
+// 统一的映射保存函数：在 Part 2 的媒体组修复和 Part 4 的转发中都会用到
+async function saveMessageMapping(d1, groupMsgId, privateChatId, privateMsgId, senderType) {
+    
+    const now = Math.floor(Date.now() / 1000);
+    await DB.run(d1, 
+        'INSERT OR REPLACE INTO message_mappings (group_message_id, private_chat_id, private_message_id, created_at, sender_type) VALUES (?, ?, ?, ?, ?)',
+        [groupMsgId, privateChatId, privateMsgId, now, senderType]
+    );
+}
+
+async function performUserDeletion(env, chatId, isWipe) {
+    // 1. 清除缓存
+    userStateCache.delete(chatId);
+    messageRateCache.delete(chatId);
+    topicIdCache.delete(chatId);
+
+    // 2. 数据库清理
+    await DB.batch(env.D1, [
+        env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(chatId),
+        env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(chatId),
+        env.D1.prepare('DELETE FROM message_mappings WHERE private_chat_id = ?').bind(chatId)
+    ]);
+
+    if (isWipe) {
+        // 彻底删除模式：还要删 Topic 和 映射表
+        const topicId = await getExistingTopicId(env.D1, chatId);
+        if (topicId) {
+            await DB.run(env.D1, 'DELETE FROM chat_topic_mappings WHERE chat_id = ?', [chatId]);
+            // 尝试关闭 Topic
+            await telegramRequest('deleteForumTopic', {
+                chat_id: GROUP_ID,
+                message_thread_id: topicId
+            });
+        }
+    }
+}
+
+// --- 2. User Info Helper ---
+async function getUserInfo(chatId) {
+    // 优先查缓存
+    let info = userInfoCache.get(chatId);
+    if (info) return info;
+
+    // 调 API 查
+    const res = await telegramRequest('getChat', { chat_id: chatId });
+    if (res.ok && res.result) {
+        const r = res.result;
+        const name = [r.first_name, r.last_name].filter(Boolean).join(' ');
+        info = {
+            id: r.id,
+            username: r.username,
+            nickname: name || r.username || `User ${chatId}`
+        };
+    } else {
+        info = { id: chatId, username: null, nickname: `User ${chatId}` };
+    }
+    userInfoCache.set(chatId, info);
+    return info;
+}
+
+// --- 3. Rate Limiting ---
+/**
+ * @param {D1Database} d1 数据库
+ * @param {string} chatId 用户ID或群组ID
+ * @param {string|null} topicId 话题ID (私聊传 null)
+ * @param {string} type 限流类型 ('start' | 'wipe' | 'general')
+ * @param {boolean} silent 是否静默拦截 (不发送提示消息)，默认 false
+ * @returns {Promise<boolean>} 如果被限流返回 true，否则返回 false
+ */
+async function guardRateLimit(d1, chatId, topicId, type, silent = false) {
+    const now = Date.now();
+
+    // === 配置中心 ===
+    const config = {
+        'start': { 
+            max: 2,  
+            window: 5 * 60 * 1000, 
+            cols: ['start_count', 'start_window_start'],
+            msg: '⏳ /start 频率过高，请稍后再试。'
+        },
+        'wipe': { 
+            max: 2,  
+            window: 60 * 1000,     
+            cols: ['wipe_count', 'wipe_window_start'],
+            msg: '⏳ Wipe 操作过于频繁，请休息一下。'
+        },
+        'general': { 
+            max: 15, 
+            window: 60 * 1000,     
+            cols: ['cmd_count', 'cmd_window_start'],
+            msg: '⏳ 操作太快，请稍后再试。'
+        }
+    };
+
+    const cfg = config[type];
+    if (!cfg) return false;
+
+    const [colCount, colStart] = cfg.cols;
+    let data = await DB.get(d1, `SELECT ${colCount} as count, ${colStart} as start FROM message_rates WHERE chat_id = ?`, [chatId]);
+    if (!data) {
+        await DB.run(d1, 'INSERT OR IGNORE INTO message_rates (chat_id) VALUES (?)', [chatId]);
+        data = { count: 0, start: now };
+    }
+
+    let count = data.count || 0;
+    let start = data.start || now;
+    if (now - start > cfg.window) {
+        count = 1;
+        start = now;
+    } else {
+        count++;
+    }
+    await DB.run(d1, `UPDATE message_rates SET ${colCount} = ?, ${colStart} = ? WHERE chat_id = ?`, [count, start, chatId]);
+    if (count > cfg.max) {
+        // 如果未静默，且配置了消息，则发送临时通知
+        if (!silent && cfg.msg) {
+            await sendTempMessage(chatId, topicId, cfg.msg);
+        }
+        return true;
+    }
+    return false;
+}
+
+// --- 4. Messaging Utilities ---
+async function sendMessageToTopic(topicId, text, opts = {}) {
+    return await telegramRequest('sendMessage', {
+        chat_id: GROUP_ID,
+        message_thread_id: topicId,
+        text: text,
+        ...opts
+    });
+}
+
+async function sendMessageToUser(chatId, text, opts = {}) {
+    return await telegramRequest('sendMessage', {
+        chat_id: chatId,
+        text: text,
+        ...opts
+    });
+}
+
+async function sendTempMessage(chatId, topicId, text) {
+    let res;
+    if (topicId) {
+        res = await sendMessageToTopic(topicId, text);
+    } else {
+        res = await sendMessageToUser(chatId, text);
+    }
+
+    if (res && res.result && CTX) {
+        // 使用 CTX.waitUntil 确保异步删除执行
+        CTX.waitUntil(new Promise(r => setTimeout(async () => {
+            await deleteMessage(topicId ? GROUP_ID : chatId, res.result.message_id);
+            r();
+        }, 5000))); // 5秒后删除
+    }
+}
+
+async function getExistingTopicId(d1, chatId) {
+    // 查缓存
+    const cached = topicIdCache.get(chatId);
+    if (cached) return cached;
+    // 查库
+    const row = await DB.get(d1, 'SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?', [chatId]);
+    const val = row ? row.topic_id : null;
+    if (val) topicIdCache.set(chatId, val);
+    return val;
+}
+
+// 缓存远程欢迎消息
+let cachedStartMessage = null;
+let cachedStartMessageTime = 0;
+
+async function getVerificationSuccessMessage(d1) {
+    const rawEnabled = await getSetting(d1, 'user_raw_enabled');
+    if (rawEnabled !== 'true') return '✅ 验证成功！';
+    
+    const now = Date.now();
+    if (cachedStartMessage && (now - cachedStartMessageTime) < CACHE_TTL) {
+        return cachedStartMessage;
+    }
+    
+    // 尝试获取远程欢迎语
+    try {
+        const res = await fetch('https://raw.githubusercontent.com/xuennai/ctt/refs/heads/main/CFTeleTrans/start.md');
+        if (res.ok) {
+            cachedStartMessage = await res.text();
+            cachedStartMessageTime = now;
+            return cachedStartMessage;
+        }
+    } catch(e) {}
+    return '✅ 验证成功！您现在可以发送消息了。';
+}
+
+/**
+ * Part 6: Missing Implementations & Utilities (Final)
+ */
+
+// --- 1. Database Maintenance ---
+async function checkAndRepairTables(d1) {
+    const tables = {
+        user_states: "chat_id TEXT PRIMARY KEY, is_blocked BOOLEAN DEFAULT FALSE, is_verified BOOLEAN DEFAULT FALSE, verified_expiry INTEGER, verification_code TEXT, code_expiry INTEGER, last_verification_message_id TEXT, is_first_verification BOOLEAN DEFAULT TRUE, is_rate_limited BOOLEAN DEFAULT FALSE, is_verifying BOOLEAN DEFAULT FALSE, verification_attempts INTEGER DEFAULT 0",
+        message_rates: "chat_id TEXT PRIMARY KEY, message_count INTEGER DEFAULT 0, window_start INTEGER, start_count INTEGER DEFAULT 0, start_window_start INTEGER, cmd_count INTEGER DEFAULT 0, cmd_window_start INTEGER, wipe_count INTEGER DEFAULT 0, wipe_window_start INTEGER",
+        chat_topic_mappings: "chat_id TEXT PRIMARY KEY, topic_id TEXT NOT NULL",
+        settings: "key TEXT PRIMARY KEY, value TEXT",
+        message_mappings: "group_message_id TEXT PRIMARY KEY, private_chat_id TEXT NOT NULL, private_message_id TEXT NOT NULL, created_at INTEGER, sender_type TEXT DEFAULT 'user'"
+    };
+
+    for (const [name, schema] of Object.entries(tables)) {
+        await DB.exec(d1, `CREATE TABLE IF NOT EXISTS ${name} (${schema})`);
+    }
+    
+    try {
+        await DB.exec(d1, "ALTER TABLE message_rates ADD COLUMN wipe_count INTEGER DEFAULT 0");
+        await DB.exec(d1, "ALTER TABLE message_rates ADD COLUMN wipe_window_start INTEGER");
+        await DB.exec(d1, "ALTER TABLE message_rates ADD COLUMN cmd_count INTEGER DEFAULT 0");
+        await DB.exec(d1, "ALTER TABLE message_rates ADD COLUMN cmd_window_start INTEGER");
+    } catch (e) {}
+
+    // Indices for performance
+    await DB.exec(d1, 'CREATE INDEX IF NOT EXISTS idx_mappings_private ON message_mappings (private_chat_id, private_message_id)');
+    await DB.exec(d1, 'CREATE INDEX IF NOT EXISTS idx_settings_key ON settings (key)');
+
+    // Default settings
+    await DB.run(d1, 'INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ['verification_enabled', 'true']);
+    await DB.run(d1, 'INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ['user_raw_enabled', 'true']);
+    await DB.run(d1, 'INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ['delete_logic_mode', '1']);
+
+    // Preload settings into cache
+    const allSettings = await DB.all(d1, 'SELECT key, value FROM settings');
+    if (allSettings.results) {
+        for (const row of allSettings.results) settingsCache.set(row.key, row.value);
+    }
+}
+
+async function cleanExpiredVerificationCodes(d1) {
+    const now = Date.now();
+    if (now - lastCleanupTime < CLEANUP_INTERVAL) return;
+    
+    const nowSec = Math.floor(now/1000);
+    // Cleanup expired codes
+    await DB.run(d1, 'UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE code_expiry IS NOT NULL AND code_expiry < ?', [nowSec]);
+    // Cleanup old mappings (older than 48h) to save space
+    await DB.run(d1, 'DELETE FROM message_mappings WHERE created_at < ?', [nowSec - 172800]);
+    lastCleanupTime = now;
+}
+
+// --- 2. Message Editing Logic (Fixed for Forwarding) ---
+async function onEditedMessage(env, message) {
+    const chatId = message.chat.id.toString();
+    const messageId = message.message_id.toString();
+    const newContent = message.text || message.caption || "";
+
+    if (chatId === GROUP_ID) {
+        // === 情况 A: 管理员在群里编辑 (Group -> Private) ===
+        // 管理员发给用户的消息是 copyMessage，属于 Bot 发送的普通消息，可以编辑
+        const mapping = await DB.get(env.D1, 'SELECT private_chat_id, private_message_id FROM message_mappings WHERE group_message_id = ?', [messageId]);
+        if (mapping) {
+            await editRemoteMessage(mapping.private_chat_id, mapping.private_message_id, newContent, message);
+        }
+    } else {
+        // === 情况 B: 用户在私聊编辑 (Private -> Group) ===
+        // 关键点：用户发到群里的消息是 forwardMessage，原生转发不支持编辑！
+        // 解决方案：删除群里的旧消息 -> 重新转发新消息
+        
+        // 1. 查出对应的旧群组消息 ID 和 发送类型
+        const mapping = await DB.get(env.D1, 'SELECT group_message_id, sender_type FROM message_mappings WHERE private_chat_id = ? AND private_message_id = ?', [chatId, messageId]);
+        
+        if (mapping) {
+            if (mapping.sender_type === 'user') {
+                // ---> 如果是用户发送的 (sender_type='user')，说明是转发消息，必须“删旧发新”
+                
+                // 1. 获取 Topic ID
+                const topicId = await getExistingTopicId(env.D1, chatId);
+                if (topicId) {
+                    // 2. 删除群里旧的那条转发
+                    await deleteMessage(GROUP_ID, mapping.group_message_id);
+                    
+                    // 3. 从数据库移除旧的映射 (防止堆积垃圾数据)
+                    await DB.run(env.D1, 'DELETE FROM message_mappings WHERE group_message_id = ?', [mapping.group_message_id]);
+
+                    // 4. 重新转发这条已编辑的消息 (performForward 会自动建立新的数据库映射)
+                    // 注意：这里 message 已经是编辑后的最新对象了
+                    await performForward(env.D1, chatId, topicId, message, messageId);
+                }
+            } else {
+                // ---> 如果 sender_type 不是 user (极少见，或者是旧数据)，尝试常规编辑
+                await editRemoteMessage(GROUP_ID, mapping.group_message_id, newContent, message);
+            }
+        }
+    }
+}
+
+async function editRemoteMessage(targetChatId, targetMessageId, text, originalMessage) {
+    const mediaInput = getMediaInput(originalMessage, text);
+    try {
+        if (mediaInput) {
+            await telegramRequest('editMessageMedia', {
+                chat_id: targetChatId,
+                message_id: targetMessageId,
+                media: mediaInput
+            });
+        } else {
+            await telegramRequest('editMessageText', {
+                chat_id: targetChatId,
+                message_id: targetMessageId,
+                text: text
+            });
+        }
+    } catch (e) {
+        console.warn(`Edit sync failed: ${e.message}`);
+    }
+}
+
+// 3. 构造媒体对象 (用于 editMessageMedia)
+function getMediaInput(message, caption) {
+    let type = '';
+    let fileId = '';
+
+    // 判断媒体类型并提取 file_id
+    if (message.photo && message.photo.length > 0) {
+        type = 'photo';
+        fileId = message.photo[message.photo.length - 1].file_id; // 取最高清图
+    } else if (message.document) {
+        type = 'document';
+        fileId = message.document.file_id;
+    } else if (message.video) {
+        type = 'video';
+        fileId = message.video.file_id;
+    } else if (message.audio) {
+        type = 'audio';
+        fileId = message.audio.file_id;
+    } else if (message.animation) {
+        type = 'animation';
+        fileId = message.animation.file_id;
+    } else {
+        // 纯文本消息，没有媒体
+        return null;
+    }
+
+    // 返回 Telegram API 需要的 InputMedia 对象结构
+    return {
+        type: type,
+        media: fileId,
+        caption: caption
+    };
+}
+
+// --- 3. Verification Generation (Mini App + Turnstile) ---
+async function handleVerification(d1, chatId, messageIdToEdit = null, prefixText = '') {
+    console.log(`[handleVerification] Starting for chatId=${chatId}, WORKER_URL=${WORKER_URL}`);
+    
+    // 检查 WORKER_URL 是否已设置
+    if (!WORKER_URL) {
+        console.error('[handleVerification] WORKER_URL is not set, cannot generate verification button');
+        await sendMessageToUser(chatId, `${prefixText}⚠️ 系统配置错误，请稍后重试或联系管理员。`);
+        return;
+    }
+
+    // 1. 生成验证 Token (用于防止伪造请求)
+    const token = generateVerifyToken(chatId);
+    const nowSec = Math.floor(Date.now() / 1000);
+    const tokenExpiry = nowSec + 180; // Token 3分钟有效
+    console.log(`[handleVerification] Generated token=${token}, expiry=${tokenExpiry} (180s)`);
+
+    // 2. 更新用户状态
+    let userState = await getUserState(d1, chatId);
+    userState.verification_code = token;
+    userState.code_expiry = tokenExpiry;
+    userState.is_verifying = true;
+    userStateCache.set(chatId, userState);
+
+    // 3. 数据库后台更新
+    const dbUpdatePromise = DB.run(d1,
+        'UPDATE user_states SET verification_code = ?, code_expiry = ?, is_verifying = TRUE WHERE chat_id = ?',
+        [token, tokenExpiry, chatId]);
+    
+    if (CTX) CTX.waitUntil(dbUpdatePromise);
+
+    // 4. 构建验证页面 URL (自动从请求中获取)
+    const verifyUrl = `${WORKER_URL}/verify_page?chat_id=${chatId}&token=${encodeURIComponent(token)}`;
+    console.log(`[handleVerification] Generated verify URL: ${verifyUrl}`);
+
+    // 5. 使用 web_app 按钮（底部弹窗，验证后自动关闭）
+    // 即使没有在 BotFather 配置，也可以使用，只是标题栏会显示域名
+    const payload = {
+        chat_id: chatId,
+        text: `${prefixText}请在 3 分钟内点击下方按钮完成人机验证`,
+        reply_markup: {
+            inline_keyboard: [[
+                {
+                    text: '点击验证',
+                    web_app: { url: verifyUrl }
+                }
+            ]]
+        }
+    };
+
+    let res;
+    try {
+        if (messageIdToEdit) {
+            payload.message_id = messageIdToEdit;
+            res = await telegramRequest('editMessageText', payload);
+        } else {
+            res = await telegramRequest('sendMessage', payload);
+        }
+        console.log(`[handleVerification] Message sent result:`, JSON.stringify(res));
+    } catch (error) {
+        console.error(`[handleVerification] Failed to send verification message:`, error.message);
+        // 如果发送失败，尝试发送纯文本消息
+        try {
+            res = await sendMessageToUser(chatId, `${prefixText}🛡️ 请点击以下链接完成人机验证：\n${verifyUrl}`);
+            console.log(`[handleVerification] Plain text message sent:`, JSON.stringify(res));
+        } catch (fallbackError) {
+            console.error(`[handleVerification] Plain text also failed:`, fallbackError.message);
+        }
+    }
+
+    // 6. 保存消息 ID
+    if (res && res.ok && res.result) {
+        const verifyMsgId = res.result.message_id;
+        console.log(`[handleVerification] Saving message ID: ${verifyMsgId}`);
+        
+        if (!messageIdToEdit) {
+            const saveIdPromise = DB.run(d1,
+                'UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?',
+                [verifyMsgId.toString(), chatId]);
+            if (CTX) CTX.waitUntil(saveIdPromise);
+        }
+    } else {
+        console.error(`[handleVerification] No valid response to save message ID, res=`, JSON.stringify(res));
+    }
+}
+
+// 生成验证 Token
+function generateVerifyToken(chatId) {
+    const timestamp = Date.now().toString(36);
+    const random = Math.random().toString(36).substring(2, 10);
+    return `${chatId}_${timestamp}_${random}`;
+}
+
+// 渲染验证页面 (Mini App HTML) - 优化版本
+function renderVerifyPage(env, chatId, token) {
+    const turnstileSiteKey = env.TURNSTILE_SITE_KEY || '1x00000000000000000000AA';
+    
+    // 极简优化版 HTML - 减少体积，加快加载
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>验证</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onLoad" async></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
+.c{text-align:center;width:100%;max-width:320px}
+.i{font-size:48px;margin-bottom:12px}
+h3{font-size:18px;margin-bottom:8px;font-weight:500}
+.d{color:var(--tg-theme-hint-color,#888);font-size:14px;margin-bottom:20px}
+#t{display:flex;justify-content:center;min-height:65px}
+#s{padding:12px 20px;border-radius:8px;font-size:14px;margin-top:16px;display:none}
+.l{display:block;background:var(--tg-theme-secondary-bg-color,#f0f0f0)}
+.ok{display:block;background:#d4edda;color:#155724}
+.er{display:block;background:#f8d7da;color:#721c24}
+</style>
+</head>
+<body>
+<div class="c">
+<div class="i">🛡️</div>
+<h3>安全验证</h3>
+<div class="d">请完成验证</div>
+<div id="t"></div>
+<div id="s"></div>
+</div>
+<script>
+const tg=window.Telegram.WebApp;tg.ready();tg.expand();
+const C='${chatId}',T='${token}',K='${turnstileSiteKey}';
+function onLoad(){turnstile.render('#t',{sitekey:K,callback:V,theme:'auto'})}
+async function V(t){
+const s=document.getElementById('s');s.className='l';s.textContent='验证中...';
+try{
+const r=await fetch('/verify_submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:C,token:T,turnstile_token:t})});
+const d=await r.json();
+if(d.success){s.className='ok';s.textContent='✅ 验证成功';setTimeout(()=>tg.close(),500)}
+else{s.className='er';s.textContent='❌ '+(d.error||'失败');turnstile.reset()}
+}catch(e){s.className='er';s.textContent='❌ 网络错误';turnstile.reset()}
+}
+</script>
+</body>
+</html>`;
+
+    return new Response(html, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+    });
+}
+
+// 处理验证提交
+async function handleVerifySubmit(env, request) {
+    try {
+        const body = await request.json();
+        const { chat_id, token, turnstile_token } = body;
+        
+        if (!chat_id || !token || !turnstile_token) {
+            return jsonResponse({ success: false, error: '参数不完整' });
+        }
+        
+        // 1. 验证 Token 是否有效
+        const userState = await getUserState(env.D1, chat_id);
+        const nowSec = Math.floor(Date.now() / 1000);
+        
+        if (!userState.verification_code || userState.verification_code !== token) {
+            return jsonResponse({ success: false, error: '验证链接已失效' });
+        }
+        
+        if (userState.code_expiry && nowSec > userState.code_expiry) {
+            return jsonResponse({ success: false, error: '验证已过期，请重新获取' });
+        }
+        
+        // 2. 验证 Turnstile Token
+        const turnstileSecret = env.TURNSTILE_SECRET_KEY || '1x0000000000000000000000000000000AA'; // 测试 secret
+        const turnstileResult = await verifyTurnstile(turnstile_token, turnstileSecret);
+        
+        if (!turnstileResult.success) {
+            return jsonResponse({ success: false, error: '人机验证失败' });
+        }
+        
+        // 3. 验证成功，更新用户状态
+        const verifiedExpiry = nowSec + (7 * 24 * 3600); // 7天有效
+        
+        await DB.run(env.D1,
+            `UPDATE user_states SET is_verified = TRUE, verified_expiry = ?, verification_code = NULL,
+             code_expiry = NULL, is_verifying = FALSE, is_first_verification = FALSE, verification_attempts = 0
+             WHERE chat_id = ?`,
+            [verifiedExpiry, chat_id]
+        );
+        
+        // 清除缓存（因为 Workers 请求间缓存不共享，这里的 set 没意义，但删除可以确保下次从 DB 读取）
+        userStateCache.delete(chat_id);
+        
+        // 重置消息速率
+        await DB.run(env.D1, 'UPDATE message_rates SET message_count = 0 WHERE chat_id = ?', [chat_id]);
+        messageRateCache.delete(chat_id);
+        
+        // 4. 发送验证成功消息（使用简单消息，避免额外 fetch）
+        await sendMessageToUser(chat_id, '✅ 验证成功！您现在可以发送消息了。', { disable_web_page_preview: true });
+        
+        // 5. 确保用户话题存在（后台执行，不阻塞响应）
+        const info = await getUserInfo(chat_id);
+        if (CTX) {
+            CTX.waitUntil(ensureUserTopic(env.D1, chat_id, info));
+        } else {
+            await ensureUserTopic(env.D1, chat_id, info);
+        }
+        
+        // 6. 删除验证消息
+        if (userState.last_verification_message_id) {
+            await deleteMessage(chat_id, userState.last_verification_message_id);
+        }
+        
+        return jsonResponse({ success: true });
+        
+    } catch (error) {
+        console.error('Verify submit error:', error);
+        return jsonResponse({ success: false, error: '服务器错误' });
+    }
+}
+
+// 验证 Turnstile Token
+async function verifyTurnstile(token, secretKey) {
+    try {
+        const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                secret: secretKey,
+                response: token
+            })
+        });
+        return await response.json();
+    } catch (error) {
+        console.error('Turnstile verification error:', error);
+        return { success: false };
+    }
+}
+
+// JSON 响应辅助函数
+function jsonResponse(data, status = 200) {
+    return new Response(JSON.stringify(data), {
+        status,
+        headers: { 'Content-Type': 'application/json' }
+    });
+}
+
+// --- 4. Action Helpers ---
+async function deleteMessage(chatId, messageId) {
+    if (!chatId || !messageId) return;
+    try {
+        await telegramRequest('deleteMessage', { chat_id: chatId, message_id: messageId });
+    } catch (e) { /* Ignore delete errors (msg might not exist) */ }
+}
+
+async function handleSyncedDelete(d1, groupMsgId, commandMsgId, commandChatId = GROUP_ID) {
+    // Delete Private Msg
+    const mapping = await DB.get(d1, 'SELECT private_chat_id, private_message_id FROM message_mappings WHERE group_message_id = ?', [groupMsgId]);
+    if (mapping) {
+        await deleteMessage(mapping.private_chat_id, mapping.private_message_id);
+        await DB.run(d1, 'DELETE FROM message_mappings WHERE group_message_id = ?', [groupMsgId]);
+    }
+    // Delete Group Msg
+    await deleteMessage(GROUP_ID, groupMsgId);
+    // Delete Command Msg
+    if (commandMsgId) await deleteMessage(commandChatId, commandMsgId);
+}
+
+async function handleBatchDelete(d1, privateChatId, count, senderType) {
+    const rows = await DB.all(d1, 
+        'SELECT group_message_id, private_message_id FROM message_mappings WHERE private_chat_id = ? AND sender_type = ? ORDER BY created_at DESC LIMIT ?', 
+        [privateChatId, senderType, count]
+    );
+    if (!rows.results.length) return;
+
+    const groupIds = [];
+    for (const row of rows.results) {
+        groupIds.push(row.group_message_id);
+        await deleteMessage(GROUP_ID, row.group_message_id);
+        await deleteMessage(privateChatId, row.private_message_id);
+    }
+    if (groupIds.length) {
+        const ph = groupIds.map(() => '?').join(',');
+        await DB.run(d1, `DELETE FROM message_mappings WHERE group_message_id IN (${ph})`, groupIds);
+    }
+}
+
+// --- 5. State & Settings Accessors  ---
+async function getUserState(d1, chatId) {
+    let s = userStateCache.get(chatId);
+    if (!s) {
+        s = await DB.get(d1, 'SELECT * FROM user_states WHERE chat_id = ?', [chatId]);
+        if (!s) {
+            s = { is_blocked: false, is_first_verification: true, is_verified: false, is_verifying: false };
+            await DB.run(d1, 'INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified) VALUES (?, ?, ?, ?)', [chatId, false, true, false]);
+        }
+        userStateCache.set(chatId, s);
+    }
+    return s;
+}
+
+async function getSetting(d1, key) {
+    if (settingsCache.has(key)) return settingsCache.get(key);
+    const row = await DB.get(d1, 'SELECT value FROM settings WHERE key = ?', [key]);
+    const val = row ? row.value : null;
+    settingsCache.set(key, val);
+    return val;
+}
+
+async function setSetting(d1, key, val) {
+    await DB.run(d1, 'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', [key, val]);
+    settingsCache.set(key, val);
+}
+
+async function getPrivateChatId(d1, topicId) {
+    // Cache check in TopicIdCache (Reverse lookup)
+    for (const [cid, tid] of topicIdCache.cache) {
+        if (tid.toString() === topicId.toString()) return cid;
+    }
+    const row = await DB.get(d1, 'SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?', [topicId]);
+    return row ? row.chat_id : null;
+}
+
+async function checkIfAdmin(userId) {
+    const res = await telegramRequest('getChatMember', { chat_id: GROUP_ID, user_id: userId });
+    return res && res.ok && ['administrator', 'creator'].includes(res.result.status);
+}
+
+// --- 6. Webhook Management  ---
+async function registerWebhook(request) {
+    const webhookUrl = `${new URL(request.url).origin}/webhook`;
+    const res = await telegramRequest('setWebhook', { url: webhookUrl });
+    return new Response(res && res.ok ? 'Webhook set' : 'Failed', { status: 200 });
+}
+
+async function unRegisterWebhook() {
+    const res = await telegramRequest('setWebhook', { url: '' });
+    return new Response(res && res.ok ? 'Webhook removed' : 'Failed', { status: 200 });
+}

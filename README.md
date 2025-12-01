@@ -1,12 +1,6 @@
 # CFTeleTrans (CTT) - Telegram消息转发分组对话机器人（基于Cloudflare）
 
 这是一个基于Cloudflare Workers实现的Telegram消息转发分组对话机器人，代号 **CFTeleTrans (CTT)**，专注于将用户消息安全、高效地转发到后台群组，同时充分利用Cloudflare的免费额度（榨干CF大善人！）。该机器人支持用户验证、消息转发、频率限制、管理员管理等功能，适用于客服、社区管理等场景。
-## 2025.05.17更新：优化，添加检测更新功能。
-## 项目截图
-
-以下是 CFTeleTrans 项目的截图： 
-
-![CFTeleTrans 截图](https://awtc.pp.ua/ctt.png)
 
 ## 特点与亮点
 
@@ -20,12 +14,15 @@
    - 用户消息自动转发到后台群组的子论坛，别人私聊你机器人就如同添加了你好友，。
    - 群聊可多个号回复用户（只需将你的号拉进群并设置管理）
    - 置顶消息显示用户信息（昵称、用户名、UserID、发起时间）及通知内容
-   - 每个用户独立一个分组，随时随地想聊就聊！
+   - 每个用户独立一个话题，随时随地想聊就聊！
    - 可通过后台群组直接回复用户消息，消息会转发到用户私聊。
+   - 支持监控并同步编辑后的文本或媒体文件。
+   - 采用原生转发，支持显示转发来源。
+   - 支持`/delete`指令撤回消息，支持`/wipe`指令批量撤回消息，轻松省力。
   
 3. **高效的用户验证机制**  
-   - 支持按钮式验证码验证（简单数学题），防止机器人刷消息。
-   - 验证状态持久化（1小时有效期），用户验证通过后无需重复验证，除非触发频率限制。
+   - 支持按钮式 CF 人机验证，有惩罚机制，防止机器人刷消息。
+   - 验证状态持久化（3分钟有效期），用户验证通过后无需重复验证，除非触发频率限制。
    - 删除聊天记录后重新开始，验证码会自动触发，确保用户体验流畅。
 
 4. **消息频率限制（防刷保护）**  
@@ -34,7 +31,7 @@
 
 5. **管理员面板功能**  
    - 支持`/admin`呼出管理员面板控制，简单方便。
-   - 支持拉黑用户，查询黑名单，关闭用户Raw，删除用户等多种功能。
+   - 支持拉黑用户，查询黑名单，关闭验证码，关闭用户Raw，重置用户，删除用户等多种功能。
 
 6. **轻量级部署**  
    - 单文件部署（仅需一个`_worker.js`），代码简洁，易于维护。
@@ -44,10 +41,10 @@
 
 ### 准备工作
 1. **创建Telegram Bot**：
-   - 在Telegram中找到`@BotFather`，发送`/newbot`创建新机器人。
-   - 按照提示设置机器人名称和用户名，获取Bot Token（例如`123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`）。
+   - 在Telegram中找到`@BotFather`。
+   - 现在 BotFather 支持小程序图形化操作，优先使用小程序。
+   - 发送`/newbot`创建新机器人，按照提示设置机器人名称和用户名，获取Bot Token（例如`123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`）。
    - 发送`/setinline`切换内联模式。
-![CFTeleTrans 截图](picture/0903f76329b80fc231893abde40b9ab8.png)
 
 2. **创建后台群组**：
    - 创建一个Telegram群组（按需设置是否公开），
@@ -66,25 +63,32 @@
 2. 导航到 **Workers和Pages > Workers和Pages**，点击 **创建**。
 3. 点击 **Hello world**，输入一个名称（例如`cfteletrans`），再点击 **部署**
 
-#### 步骤 3：配置环境变量
+#### 步骤 3：获取 Turnstile 密钥 ####
+1. 登录 Cloudflare Dashboard
+2. 点击左侧 应用程序安全 进入 Turnstile 页面
+3. 名称随意，添加主机名，填写你的 Worker 域名（例如 xxx.workers.dev）
+4. 创建新站点，获取 Site Key 和 Secret Key
+
+#### 步骤 4：配置环境变量
 1. 在创建的Workers项目 **设置 > 变量和机密** 中，添加以下变量：
 - `BOT_TOKEN_ENV`：您的Telegram Bot Token（例如`123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`）。
 - `GROUP_ID_ENV`：后台群组的Chat ID（例如`-100123456789`）。
 - `MAX_MESSAGES_PER_MINUTE_ENV`：消息频率限制（例如`40`）。
+- `TURNSTILE_SECRET_KEY`：Turnstile密钥（例如`0x4XXXXXXCD5_XiX2HfXXXOR_bXaXXZdXa4`）
+- `TURNSTILE_SITE_KEY`：Turnstile站点密钥（例如`0x4XXXXXXCD5_XxXzxv70x38`）
 
-#### 步骤 4：绑定D1 SQL数据库
+#### 步骤 5：绑定D1 SQL数据库
 1. 在创建的Workers项目 **设置 > 绑定** 中，绑定数据库：
 - 添加-选择D1数据库
 - 变量名称 `D1`
 - D1 数据库 选择刚建的数据库（例如`cfteletrans-db`），
 - 点击 **编辑代码**，把原来的代码用本项目中的_worker.js代码替换后部署
 
-#### 步骤 5：测试
+#### 步骤 6：测试
 1. 在Telegram中找到您的机器人，发送`/start`。
-2. 确认收到“你好，欢迎使用私聊机器人！”并触发验证码。
-3. 完成验证，确认收到合并消息，例如：
+2. 确认正确触发验证，Bot 发送带有 Mini App 按钮的消息。
+3. 完成验证，确认收到合并消息。
 4. 发送消息，确认消息转发到后台群组的子论坛。
-
 
 ## 需要在 Cloudflare 绑定的变量表
 
@@ -95,6 +99,8 @@
 | `BOT_TOKEN_ENV`            | 环境变量   | Telegram Bot 的 Token，用于与 Telegram API 通信。                        | `your-telegram-bot-token`  |
 | `GROUP_ID_ENV`             | 环境变量   | Telegram 群组的 ID，用于消息转发和客服回复。                             | `-123456789`               |
 | `MAX_MESSAGES_PER_MINUTE_ENV` | 环境变量 | 每分钟允许的最大消息数，用于限制用户发送频率。                           | `40`                       |
+| `TURNSTILE_SECRET_KEY`                | 环境变量 | Turnstie密钥                  | `0x4XXXXXXCD5_XiX2HfXXXOR_bXaXXZdXa4`                       |
+| `TURNSTILE_SITE_KEY`                | 环境变量 | Turnstile站点密钥                   | `0x4XXXXXXCD5_XxXzxv70x38`                       |
 | `D1`                       | D1 绑定    | Cloudflare D1 数据库绑定，用于存储用户状态、消息频率和群组映射。         | `cfteletrans-db`           |
 
 
