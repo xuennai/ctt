@@ -239,8 +239,11 @@ async function onMessage(env, message) {
         // Command: /admin (管理面板)
         if (privateChatId && /^\/admin(@\w+)?$/i.test(text)) {
             if (await guardRateLimit(env.D1, GROUP_ID, topicId, 'general', true)) return;
-            await deleteMessage(chatId, messageId);
-            await sendAdminPanel(env.D1, chatId, topicId, privateChatId, messageId, false);
+            // 并行执行：删除命令消息 + 发送面板
+            await Promise.all([
+                deleteMessage(chatId, messageId),
+                sendAdminPanel(env, chatId, topicId, privateChatId, null, false)
+            ]);
             return;
         }
 
@@ -277,8 +280,10 @@ async function onMessage(env, message) {
     }
 
     // --- Verification Logic ---
-    const verifyEnabled = (await getSetting(env.D1, 'verification_enabled')) === 'true';
-    console.log(`[Verify] chatId=${chatId}, verifyEnabled=${verifyEnabled}, userState=`, JSON.stringify(userState));
+    // 检查 Turnstile 密钥是否配置，未配置则强制跳过验证
+    const hasTurnstileKeys = env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET_KEY;
+    const verifyEnabled = hasTurnstileKeys && (await getSetting(env.D1, 'verification_enabled')) === 'true';
+    console.log(`[Verify] chatId=${chatId}, hasTurnstileKeys=${hasTurnstileKeys}, verifyEnabled=${verifyEnabled}, userState=`, JSON.stringify(userState));
 
     if (verifyEnabled) {
         const now = Math.floor(Date.now() / 1000);
@@ -625,7 +630,7 @@ async function onCallbackQuery(env, query) {
         }
 
         if (shouldRefreshPanel) {
-            await sendAdminPanel(env.D1, chatId, query.message.message_thread_id, param, messageId, true);
+            await sendAdminPanel(env, chatId, query.message.message_thread_id, param, messageId, true);
         }
 
         await telegramRequest('answerCallbackQuery', {
@@ -641,14 +646,18 @@ async function onCallbackQuery(env, query) {
 }
 
 // --- 2. Admin Panel UI ---
-async function sendAdminPanel(d1, chatId, topicId, privateChatId, messageId, isEdit) {
+async function sendAdminPanel(env, chatId, topicId, privateChatId, messageId, isEdit) {
+    const d1 = env.D1;
     const [vEnabled, rEnabled] = await Promise.all([
         getSetting(d1, 'verification_enabled'),
         getSetting(d1, 'user_raw_enabled')
     ]);
 
-    // 状态可视化
-    const vIcon = vEnabled === 'true' ? '✅' : '🔴';
+    // 检查 Turnstile 密钥是否配置
+    const hasTurnstileKeys = env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET_KEY;
+    
+    // 状态可视化：如果没配置密钥，显示警告图标
+    const vIcon = !hasTurnstileKeys ? '⚠️' : (vEnabled === 'true' ? '✅' : '🔴');
     const rIcon = rEnabled === 'true' ? '✅' : '🔴';
 
     const buttons = [
@@ -673,7 +682,12 @@ async function sendAdminPanel(d1, chatId, topicId, privateChatId, messageId, isE
         ]
     ];
 
-    const text = `🔧 <b>管理员控制台</b>`;
+    // 面板标题：如果没配置密钥则显示警告
+    let text = `🔧 <b>管理员控制台</b>`;
+    if (!hasTurnstileKeys) {
+        text += `\n\n⚠️ <i>未配置 Turnstile 密钥，验证功能已禁用</i>`;
+    }
+    
     const payload = {
         chat_id: chatId,
         text: text,
@@ -976,7 +990,11 @@ async function guardRateLimit(d1, chatId, topicId, type, silent = false) {
     } else {
         count++;
     }
-    await DB.run(d1, `UPDATE message_rates SET ${colCount} = ?, ${colStart} = ? WHERE chat_id = ?`, [count, start, chatId]);
+    
+    // 后台写入，不阻塞当前请求
+    const updatePromise = DB.run(d1, `UPDATE message_rates SET ${colCount} = ?, ${colStart} = ? WHERE chat_id = ?`, [count, start, chatId]);
+    if (CTX) CTX.waitUntil(updatePromise);
+    
     if (count > cfg.max) {
         // 如果未静默，且配置了消息，则发送临时通知
         if (!silent && cfg.msg) {
@@ -1076,12 +1094,22 @@ async function checkAndRepairTables(d1) {
         await DB.exec(d1, `CREATE TABLE IF NOT EXISTS ${name} (${schema})`);
     }
     
-    try {
-        await DB.exec(d1, "ALTER TABLE message_rates ADD COLUMN wipe_count INTEGER DEFAULT 0");
-        await DB.exec(d1, "ALTER TABLE message_rates ADD COLUMN wipe_window_start INTEGER");
-        await DB.exec(d1, "ALTER TABLE message_rates ADD COLUMN cmd_count INTEGER DEFAULT 0");
-        await DB.exec(d1, "ALTER TABLE message_rates ADD COLUMN cmd_window_start INTEGER");
-    } catch (e) {}
+    // 迁移：为旧表添加新字段（每个字段独立 try-catch，避免一个失败全部跳过）
+    const alterStatements = [
+        "ALTER TABLE message_rates ADD COLUMN wipe_count INTEGER DEFAULT 0",
+        "ALTER TABLE message_rates ADD COLUMN wipe_window_start INTEGER",
+        "ALTER TABLE message_rates ADD COLUMN cmd_count INTEGER DEFAULT 0",
+        "ALTER TABLE message_rates ADD COLUMN cmd_window_start INTEGER",
+        "ALTER TABLE message_mappings ADD COLUMN sender_type TEXT DEFAULT 'user'"
+    ];
+    
+    for (const sql of alterStatements) {
+        try {
+            await DB.exec(d1, sql);
+        } catch (e) {
+            // 字段已存在时会报错，忽略即可
+        }
+    }
 
     // Indices for performance
     await DB.exec(d1, 'CREATE INDEX IF NOT EXISTS idx_mappings_private ON message_mappings (private_chat_id, private_message_id)');
@@ -1409,8 +1437,9 @@ async function handleVerifySubmit(env, request) {
         await DB.run(env.D1, 'UPDATE message_rates SET message_count = 0 WHERE chat_id = ?', [chat_id]);
         messageRateCache.delete(chat_id);
         
-        // 4. 发送验证成功消息（使用简单消息，避免额外 fetch）
-        await sendMessageToUser(chat_id, '✅ 验证成功！您现在可以发送消息了。', { disable_web_page_preview: true });
+        // 4. 发送验证成功消息（使用缓存的远程消息）
+        const successMsg = await getVerificationSuccessMessage(env.D1);
+        await sendMessageToUser(chat_id, successMsg, { disable_web_page_preview: true });
         
         // 5. 确保用户话题存在（后台执行，不阻塞响应）
         const info = await getUserInfo(chat_id);

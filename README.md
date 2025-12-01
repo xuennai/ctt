@@ -64,7 +64,7 @@
 3. 点击 **Hello world**，输入一个名称（例如`cfteletrans`），再点击 **部署**
 
 #### 步骤 3：获取 Turnstile 密钥 ####
-1. 登录 Cloudflare Dashboard
+1. 登录[Cloudflare仪表板](https://dash.cloudflare.com/)。
 2. 点击左侧 应用程序安全 进入 Turnstile 页面
 3. 名称随意，添加主机名，填写你的 Worker 域名（例如 xxx.workers.dev）
 4. 创建新站点，获取 Site Key 和 Secret Key
@@ -89,6 +89,18 @@
 2. 确认正确触发验证，Bot 发送带有 Mini App 按钮的消息。
 3. 完成验证，确认收到合并消息。
 4. 发送消息，确认消息转发到后台群组的子论坛。
+
+### 📌 迁移/升级提示
+**如果是从原项目迁移过来，且没有删除重建数据库**，建议在浏览器中依次访问以下链接以完成配置更新：
+
+1. **注册 Webhook**
+   `https://xxx.xxx.workers.dev/registerWebhook`
+2. **检查数据表**
+   `https://你的域名/checkTables`
+3. **检查 Webhook 状态**
+   `https://api.telegram.org/bot{你的BOT_TOKEN}/getWebhookInfo`
+> **📝 注意：** 请使用你自己的 Workers URL 和 Bot Token 替换上述链接中的占位符。
+> * 特别注意 Telegram API 链接中的 `bot` 字符不要删除，直接在后面跟上你的 Token。
 
 ## 需要在 Cloudflare 绑定的变量表
 
