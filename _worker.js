@@ -10,7 +10,7 @@ let CTX;
 let WORKER_URL;
 
 let lastCleanupTime = 0;
-const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; 
+const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000;
 let isInitialized = false;
 
 // Caches
@@ -125,12 +125,12 @@ export default {
         }
 
         const url = new URL(request.url);
-        
+
         // 自动获取 Worker URL (从任何请求中提取 origin)
         if (!WORKER_URL) {
             WORKER_URL = url.origin;
         }
-        
+
         if (url.pathname === '/webhook' && request.method === 'POST') {
             try {
                 const update = await request.json();
@@ -138,7 +138,7 @@ export default {
                 return new Response('OK');
             } catch (e) { return new Response('Bad Request', { status: 400 }); }
         }
-        
+
         // Verification Page Route (Mini App)
         if (url.pathname === '/verify_page') {
             const chatId = url.searchParams.get('chat_id');
@@ -146,14 +146,14 @@ export default {
             if (!chatId || !token) {
                 return new Response('Missing parameters', { status: 400 });
             }
-            return renderVerifyPage(env, chatId, token);
+            return await renderVerifyPage(env, chatId, token);
         }
-        
+
         // Verification Submit Route
         if (url.pathname === '/verify_submit' && request.method === 'POST') {
             return await handleVerifySubmit(env, request);
         }
-        
+
         // Simple routes
         switch (url.pathname) {
             case '/registerWebhook': return await registerWebhook(request);
@@ -198,13 +198,13 @@ async function onMessage(env, message) {
         if (!topicId) return;
 
         const privateChatId = await getPrivateChatId(env.D1, topicId);
-        
+
         // Command: /delete (删除指令)
         if (/^\/delete(@\w+)?$/i.test(text)) {
             if (!privateChatId) return;
             if (await guardRateLimit(env.D1, GROUP_ID, topicId, 'general')) return;
-            try { await deleteMessage(GROUP_ID, messageId); } catch (e) {}
-            
+            try { await deleteMessage(GROUP_ID, messageId); } catch (e) { }
+
             let targetGroupMsgId = null;
             // 如果是对某条消息回复 /delete
             if (message.reply_to_message && !message.reply_to_message.forum_topic_created) {
@@ -217,7 +217,7 @@ async function onMessage(env, message) {
 
             if (targetGroupMsgId) {
                 // 执行双向删除
-                await handleSyncedDelete(env.D1, targetGroupMsgId, null); 
+                await handleSyncedDelete(env.D1, targetGroupMsgId, null);
                 // 添加删除成功的提示
                 // await sendTempMessage(chatId, topicId, "🗑 消息已删除。");
             } else {
@@ -231,7 +231,7 @@ async function onMessage(env, message) {
             if (await guardRateLimit(env.D1, GROUP_ID, topicId, 'wipe')) return;
             const count = Math.min(Math.max(parseInt(text.split(/\s+/)[1] || '3'), 1), 50);
             await handleBatchDelete(env.D1, privateChatId, count, 'admin');
-            try { await deleteMessage(chatId, messageId); } catch (e) {}
+            try { await deleteMessage(chatId, messageId); } catch (e) { }
             await sendTempMessage(chatId, topicId, `🗑 已撤回最近 ${count} 条消息。`);
             return;
         }
@@ -251,7 +251,7 @@ async function onMessage(env, message) {
         if (privateChatId) {
             // Check Block/Verification status
             const userState = await getUserState(env.D1, privateChatId);
-            
+
             if (userState.is_blocked) {
                 await sendTempMessage(chatId, topicId, "🚫 发送失败：该用户已被拉黑。");
                 return;
@@ -276,7 +276,7 @@ async function onMessage(env, message) {
     // 被拉黑后给予提示
     if (userState.is_blocked) {
         await sendMessageToUser(chatId, "🚫 您已被拉黑，无法发送消息，请联系管理员。");
-        return; 
+        return;
     }
 
     // --- Verification Logic ---
@@ -289,19 +289,19 @@ async function onMessage(env, message) {
         const now = Math.floor(Date.now() / 1000);
         const isVerifiedValid = userState.is_verified && (!userState.verified_expiry || now < userState.verified_expiry);
         console.log(`[Verify] now=${now}, isVerifiedValid=${isVerifiedValid}, is_verified=${userState.is_verified}, verified_expiry=${userState.verified_expiry}`);
-        
+
         if (isVerifiedValid) {
             // 用户状态正常，什么都不做，让代码继续往下走去转发消息
             console.log(`[Verify] User verified, proceeding to forward message`);
         } else {
             // 检查验证码格式：新 Token 格式为 "chatId_timestamp_random"，旧数学答案是纯数字
             const isNewTokenFormat = userState.verification_code && userState.verification_code.includes('_');
-            
+
             // 如果有旧格式数据（旧验证码或无效的 code_expiry），清理它们
             const hasOldData = (userState.verification_code && !isNewTokenFormat) ||
-                               (userState.code_expiry && !userState.verification_code) ||
-                               (userState.code_expiry && userState.code_expiry > now + 86400); // 超过24小时的过期时间肯定是旧数据
-            
+                (userState.code_expiry && !userState.verification_code) ||
+                (userState.code_expiry && userState.code_expiry > now + 86400); // 超过24小时的过期时间肯定是旧数据
+
             if (hasOldData) {
                 console.log(`[Verify] Old data detected, clearing: code=${userState.verification_code}, expiry=${userState.code_expiry}`);
                 userState.verification_code = null;
@@ -311,7 +311,7 @@ async function onMessage(env, message) {
                 await DB.run(env.D1, 'UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?', [chatId]);
                 // 清理后继续往下走，发送新的验证
             }
-            
+
             // 条件：处于惩罚冷却期内（有 code_expiry 但没有 verification_code，且 code_expiry 在合理范围内）
             if (userState.code_expiry && now < userState.code_expiry && !userState.verification_code) {
                 const remainingSeconds = userState.code_expiry - now;
@@ -334,27 +334,38 @@ async function onMessage(env, message) {
                     await sendMessageToUser(chatId, `👆 请点击上方按钮完成验证（剩余 ${remainingText}）`);
                     return; // 阻断消息
                 }
-                
+
                 // Token 已过期 - 进入惩罚冷却期
-                console.log(`[Verify] Token expired, entering cooldown period`);
-                
+                if (userState.last_verification_message_id) {
+                    try {
+                        await telegramRequest('editMessageText', {
+                            chat_id: chatId,
+                            message_id: userState.last_verification_message_id,
+                            text: "⏰ 验证已超时，请按下方提示重新操作。",
+                            reply_markup: { inline_keyboard: [] } // 清空按钮
+                        });
+                    } catch (e) {
+                        // 忽略编辑失败（可能消息已被用户删了）
+                    }
+                }
+
                 // 增加验证失败次数
                 const attempts = (userState.verification_attempts || 0) + 1;
                 // 惩罚时间：首次 30 秒，之后每次翻倍，最多 5 分钟
                 const cooldownSeconds = Math.min(30 * Math.pow(2, attempts - 1), 300);
                 const cooldownExpiry = now + cooldownSeconds;
-                
+
                 // 更新状态：清除验证码，设置冷却期
                 userState.verification_code = null;
                 userState.is_verifying = false;
                 userState.code_expiry = cooldownExpiry;
                 userState.verification_attempts = attempts;
                 userStateCache.set(chatId, userState);
-                
+
                 await DB.run(env.D1,
                     'UPDATE user_states SET verification_code = NULL, is_verifying = FALSE, code_expiry = ?, verification_attempts = ? WHERE chat_id = ?',
                     [cooldownExpiry, attempts, chatId]);
-                
+
                 await sendMessageToUser(chatId, `⏰ 验证超时！请等待 ${cooldownSeconds} 秒后重试。`);
                 return;
             }
@@ -362,9 +373,9 @@ async function onMessage(env, message) {
             const prompt = userState.is_first_verification
                 ? "👋 初次对话请先完成人机验证，"
                 : "⚠️ 验证过期或检测到异常，请重新验证，";
-            
+
             console.log(`[Verify] Sending verification to user, prompt=${prompt}`);
-            await handleVerification(env.D1, chatId, null, prompt);
+            await handleVerification(env.D1, chatId, null, prompt, userState);
             return;
         }
     }
@@ -389,9 +400,9 @@ async function onMessage(env, message) {
             const lastUserMsg = await DB.get(env.D1, 'SELECT group_message_id FROM message_mappings WHERE private_chat_id = ? AND sender_type = ? ORDER BY created_at DESC LIMIT 1', [chatId, 'user']);
             if (lastUserMsg) targetGroupMsgId = lastUserMsg.group_message_id;
         }
-        
+
         if (targetGroupMsgId) {
-            await handleSyncedDelete(env.D1, targetGroupMsgId, messageId, chatId); 
+            await handleSyncedDelete(env.D1, targetGroupMsgId, messageId, chatId);
             // 用户侧删除通常不需要额外提示“删除成功”，因为消息视觉上消失了
             // 如果你需要提示，可以在这里加：await sendMessageToUser(chatId, "已删除");
         } else {
@@ -405,7 +416,7 @@ async function onMessage(env, message) {
         if (await guardRateLimit(env.D1, chatId, null, 'wipe')) return;
         const count = Math.min(Math.max(parseInt(text.split(/\s+/)[1] || '3'), 1), 50);
         await handleBatchDelete(env.D1, chatId, count, 'user');
-        try { await deleteMessage(chatId, messageId); } catch (e) {}
+        try { await deleteMessage(chatId, messageId); } catch (e) { }
         return;
     }
 
@@ -416,7 +427,7 @@ async function onMessage(env, message) {
     let topicId;
     try {
         topicId = await ensureUserTopic(env.D1, chatId, userInfo);
-    } catch(e) {
+    } catch (e) {
         await sendMessageToUser(chatId, "系统繁忙，无法创建话题。");
         return;
     }
@@ -431,7 +442,7 @@ async function onMessage(env, message) {
 // --- Media Group Handling ---
 async function handleMediaGroupBuffer(d1, chatId, topicId, message, originalMessageId) {
     const groupId = message.media_group_id;
-    
+
     if (!mediaGroupCache.has(groupId)) {
         let resolveFunc;
         const promise = new Promise(resolve => { resolveFunc = resolve; });
@@ -467,9 +478,9 @@ async function handleMediaGroupBuffer(d1, chatId, topicId, message, originalMess
                 for (let i = 0; i < result.result.length; i++) {
                     const newMsg = result.result[i];
                     const originalMsg = msgs[i]; // Corresponds to the sorted input
-                    
+
                     if (newMsg && originalMsg) {
-                        await saveMessageMapping(d1, newMsg.message_id.toString(), chatId, originalMsg.message_id.toString(), 'user');
+                        await saveMessageMapping(d1, newMsg.message_id.toString(), chatId, originalMsg.message_id.toString(), 'user', groupId);
                     }
                 }
             }
@@ -518,18 +529,18 @@ async function onCallbackQuery(env, query) {
 
     let action = data;
     let param = '';
-    
+
     const prefixes = [
-        'block_', 'unblock_', 
-        'toggle_verification_', 'check_blocklist_', 'toggle_user_raw_', 
-        'pre_del_keep_', 'pre_del_wipe_', 
-        'del_keep_', 'del_wipe_', 
+        'block_', 'unblock_',
+        'toggle_verification_', 'check_blocklist_', 'toggle_user_raw_',
+        'pre_del_keep_', 'pre_del_wipe_',
+        'del_keep_', 'del_wipe_',
         'close_admin_panel_', 'back_admin_'
     ];
-    
+
     for (const prefix of prefixes) {
         if (data.startsWith(prefix)) {
-            action = prefix.slice(0, -1); 
+            action = prefix.slice(0, -1);
             param = data.slice(prefix.length);
             break;
         }
@@ -585,17 +596,19 @@ async function onCallbackQuery(env, query) {
             case 'pre_del_keep':
             case 'pre_del_wipe':
                 const isWipe = action === 'pre_del_wipe';
-                const warning = isWipe 
+                const warning = isWipe
                     ? `⚠️ <b>危险操作</b>\n确定要 <b>彻底删除</b> 用户 <code>${param}</code> 吗？\n这将删除数据库记录并关闭 Topic。`
                     : `⚠️ <b>重置确认</b>\n确定要重置用户 <code>${param}</code> 的状态吗？\nTopic 将保留。`;
                 const confirmBtn = isWipe ? `del_wipe_${param}` : `del_keep_${param}`;
-                
+
                 await telegramRequest('editMessageText', {
                     chat_id: chatId, message_id: messageId, text: warning, parse_mode: 'HTML',
-                    reply_markup: { inline_keyboard: [[
-                        { text: '⚠️ 确认执行', callback_data: confirmBtn },
-                        { text: '🔙 返回', callback_data: `back_admin_${param}` }
-                    ]]}
+                    reply_markup: {
+                        inline_keyboard: [[
+                            { text: '⚠️ 确认执行', callback_data: confirmBtn },
+                            { text: '🔙 返回', callback_data: `back_admin_${param}` }
+                        ]]
+                    }
                 });
                 shouldRefreshPanel = false;
                 break;
@@ -611,12 +624,12 @@ async function onCallbackQuery(env, query) {
                 }
 
                 await performUserDeletion(env, param, action === 'del_wipe');
-                await deleteMessage(chatId, messageId); 
-                
+                await deleteMessage(chatId, messageId);
+
                 if (action === 'del_keep' && query.message.message_thread_id) {
-                     await sendMessageToTopic(query.message.message_thread_id, `用户 ${param} 状态已重置。`);
+                    await sendMessageToTopic(query.message.message_thread_id, `用户 ${param} 状态已重置。`);
                 }
-                
+
                 toastText = action === 'del_wipe' ? '用户已彻底删除' : '用户已重置';
                 shouldRefreshPanel = false;
                 break;
@@ -655,7 +668,7 @@ async function sendAdminPanel(env, chatId, topicId, privateChatId, messageId, is
 
     // 检查 Turnstile 密钥是否配置
     const hasTurnstileKeys = env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET_KEY;
-    
+
     // 状态可视化：如果没配置密钥，显示警告图标
     const vIcon = !hasTurnstileKeys ? '⚠️' : (vEnabled === 'true' ? '✅' : '🔴');
     const rIcon = rEnabled === 'true' ? '✅' : '🔴';
@@ -687,7 +700,7 @@ async function sendAdminPanel(env, chatId, topicId, privateChatId, messageId, is
     if (!hasTurnstileKeys) {
         text += `\n\n⚠️ <i>未配置 Turnstile 密钥，验证功能已禁用</i>`;
     }
-    
+
     const payload = {
         chat_id: chatId,
         text: text,
@@ -697,7 +710,7 @@ async function sendAdminPanel(env, chatId, topicId, privateChatId, messageId, is
 
     if (isEdit) {
         payload.message_id = messageId;
-        try { await telegramRequest('editMessageText', payload); } catch (e) {}
+        try { await telegramRequest('editMessageText', payload); } catch (e) { }
     } else {
         payload.message_thread_id = topicId;
         await telegramRequest('sendMessage', payload);
@@ -717,7 +730,7 @@ async function sendAdminPanel(env, chatId, topicId, privateChatId, messageId, is
 async function ensureUserTopic(d1, chatId, userInfo) {
     let lock = topicCreationLocks.get(chatId);
     if (lock) {
-        await lock; 
+        await lock;
         const cached = await getExistingTopicId(d1, chatId);
         if (cached) return cached;
     }
@@ -731,7 +744,7 @@ async function ensureUserTopic(d1, chatId, userInfo) {
             // 截断名称防止报错
             const res = await telegramRequest('createForumTopic', {
                 chat_id: GROUP_ID,
-                name: name.substring(0, 127) 
+                name: name.substring(0, 127)
             });
 
             if (!res.ok) throw new Error('Create topic failed');
@@ -742,7 +755,7 @@ async function ensureUserTopic(d1, chatId, userInfo) {
 
             await DB.run(d1, 'INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)', [chatId, topicId]);
             topicIdCache.set(chatId, topicId);
-            
+
             return topicId;
         } catch (e) {
             console.error(`Create topic error for ${chatId}:`, e);
@@ -764,25 +777,25 @@ async function ensureUserTopic(d1, chatId, userInfo) {
 // --- 2. Topic Intro Message (with Notification) ---
 async function sendTopicIntroMessage(topicId, userInfo, userId) {
     const time = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-    
+
     // 获取通知内容
     const notificationContent = await getNotificationContent();
-    
-    const text = 
-`<b>🛡 用户信息卡片</b>
+
+    const text =
+        `<b>🛡 用户信息卡片</b>
 昵称: ${userInfo.nickname}
-用户名: ${userInfo.username ? '@'+userInfo.username : '无'}
+用户名: ${userInfo.username ? '@' + userInfo.username : '无'}
 ID: <code>${userId}</code>
 时间: ${time}
 
 ${notificationContent}`;
 
     const res = await sendMessageToTopic(topicId, text, { parse_mode: 'HTML' });
-    
+
     // 如果 HTML 解析失败（通常因为通知内容里有特殊字符），降级为纯文本发送
     if (!res || !res.ok) {
-         const plainText = `🛡 用户信息卡片\n昵称: ${userInfo.nickname}\nID: ${userId}\n时间: ${time}\n\n${notificationContent}`;
-         await sendMessageToTopic(topicId, plainText);
+        const plainText = `🛡 用户信息卡片\n昵称: ${userInfo.nickname}\nID: ${userId}\n时间: ${time}\n\n${notificationContent}`;
+        await sendMessageToTopic(topicId, plainText);
     } else if (res.result) {
         // 置顶消息
         await telegramRequest('pinChatMessage', {
@@ -803,7 +816,7 @@ async function getNotificationContent() {
     if (cachedNotification !== null && (now - cachedNotificationTime) < CACHE_TTL) {
         return cachedNotification;
     }
-    
+
     try {
         const response = await fetch('https://raw.githubusercontent.com/xuennai/ctt/refs/heads/main/CFTeleTrans/notification.md');
         if (!response.ok) {
@@ -830,7 +843,7 @@ async function forwardUserMessageWithRetry(d1, chatId, topicId, message, userInf
         const errStr = error.toString().toLowerCase();
         if (errStr.includes('thread not found') || errStr.includes('topic not found') || errStr.includes('thread is invalid')) {
             console.log(`Topic invalid for ${chatId}, recreating...`);
-            
+
             await DB.run(d1, 'DELETE FROM chat_topic_mappings WHERE chat_id = ?', [chatId]);
             topicIdCache.delete(chatId);
 
@@ -864,7 +877,7 @@ async function forwardMessageToPrivateChat(privateChatId, message) {
         from_chat_id: message.chat.id,
         message_id: message.message_id
     });
-    
+
     if (res.ok && res.result) {
         return res.result.message_id;
     }
@@ -878,13 +891,13 @@ async function forwardMessageToPrivateChat(privateChatId, message) {
  */
 
 // --- 1. Mapping Helpers ---
-// 统一的映射保存函数：在 Part 2 的媒体组修复和 Part 4 的转发中都会用到
-async function saveMessageMapping(d1, groupMsgId, privateChatId, privateMsgId, senderType) {
-    
+// 修改函数签名，增加 mediaGroupId 参数，默认为 null
+async function saveMessageMapping(d1, groupMsgId, privateChatId, privateMsgId, senderType, mediaGroupId = null) {
     const now = Math.floor(Date.now() / 1000);
-    await DB.run(d1, 
-        'INSERT OR REPLACE INTO message_mappings (group_message_id, private_chat_id, private_message_id, created_at, sender_type) VALUES (?, ?, ?, ?, ?)',
-        [groupMsgId, privateChatId, privateMsgId, now, senderType]
+    // 修改 SQL 语句，插入 media_group_id
+    await DB.run(d1,
+        'INSERT OR REPLACE INTO message_mappings (group_message_id, private_chat_id, private_message_id, created_at, sender_type, media_group_id) VALUES (?, ?, ?, ?, ?, ?)',
+        [groupMsgId, privateChatId, privateMsgId, now, senderType, mediaGroupId]
     );
 }
 
@@ -952,21 +965,21 @@ async function guardRateLimit(d1, chatId, topicId, type, silent = false) {
 
     // === 配置中心 ===
     const config = {
-        'start': { 
-            max: 2,  
-            window: 5 * 60 * 1000, 
+        'start': {
+            max: 2,
+            window: 5 * 60 * 1000,
             cols: ['start_count', 'start_window_start'],
             msg: '⏳ /start 频率过高，请稍后再试。'
         },
-        'wipe': { 
-            max: 2,  
-            window: 60 * 1000,     
+        'wipe': {
+            max: 2,
+            window: 60 * 1000,
             cols: ['wipe_count', 'wipe_window_start'],
             msg: '⏳ Wipe 操作过于频繁，请休息一下。'
         },
-        'general': { 
-            max: 15, 
-            window: 60 * 1000,     
+        'general': {
+            max: 15,
+            window: 60 * 1000,
             cols: ['cmd_count', 'cmd_window_start'],
             msg: '⏳ 操作太快，请稍后再试。'
         }
@@ -990,11 +1003,11 @@ async function guardRateLimit(d1, chatId, topicId, type, silent = false) {
     } else {
         count++;
     }
-    
+
     // 后台写入，不阻塞当前请求
     const updatePromise = DB.run(d1, `UPDATE message_rates SET ${colCount} = ?, ${colStart} = ? WHERE chat_id = ?`, [count, start, chatId]);
     if (CTX) CTX.waitUntil(updatePromise);
-    
+
     if (count > cfg.max) {
         // 如果未静默，且配置了消息，则发送临时通知
         if (!silent && cfg.msg) {
@@ -1058,12 +1071,12 @@ let cachedStartMessageTime = 0;
 async function getVerificationSuccessMessage(d1) {
     const rawEnabled = await getSetting(d1, 'user_raw_enabled');
     if (rawEnabled !== 'true') return '✅ 验证成功！';
-    
+
     const now = Date.now();
     if (cachedStartMessage && (now - cachedStartMessageTime) < CACHE_TTL) {
         return cachedStartMessage;
     }
-    
+
     // 尝试获取远程欢迎语
     try {
         const res = await fetch('https://raw.githubusercontent.com/xuennai/ctt/refs/heads/main/CFTeleTrans/start.md');
@@ -1072,7 +1085,7 @@ async function getVerificationSuccessMessage(d1) {
             cachedStartMessageTime = now;
             return cachedStartMessage;
         }
-    } catch(e) {}
+    } catch (e) { }
     return '✅ 验证成功！您现在可以发送消息了。';
 }
 
@@ -1093,16 +1106,17 @@ async function checkAndRepairTables(d1) {
     for (const [name, schema] of Object.entries(tables)) {
         await DB.exec(d1, `CREATE TABLE IF NOT EXISTS ${name} (${schema})`);
     }
-    
+
     // 迁移：为旧表添加新字段（每个字段独立 try-catch，避免一个失败全部跳过）
     const alterStatements = [
         "ALTER TABLE message_rates ADD COLUMN wipe_count INTEGER DEFAULT 0",
         "ALTER TABLE message_rates ADD COLUMN wipe_window_start INTEGER",
         "ALTER TABLE message_rates ADD COLUMN cmd_count INTEGER DEFAULT 0",
         "ALTER TABLE message_rates ADD COLUMN cmd_window_start INTEGER",
-        "ALTER TABLE message_mappings ADD COLUMN sender_type TEXT DEFAULT 'user'"
+        "ALTER TABLE message_mappings ADD COLUMN sender_type TEXT DEFAULT 'user'",
+        "ALTER TABLE message_mappings ADD COLUMN media_group_id TEXT"
     ];
-    
+
     for (const sql of alterStatements) {
         try {
             await DB.exec(d1, sql);
@@ -1130,8 +1144,8 @@ async function checkAndRepairTables(d1) {
 async function cleanExpiredVerificationCodes(d1) {
     const now = Date.now();
     if (now - lastCleanupTime < CLEANUP_INTERVAL) return;
-    
-    const nowSec = Math.floor(now/1000);
+
+    const nowSec = Math.floor(now / 1000);
     // Cleanup expired codes
     await DB.run(d1, 'UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE code_expiry IS NOT NULL AND code_expiry < ?', [nowSec]);
     // Cleanup old mappings (older than 48h) to save space
@@ -1156,20 +1170,20 @@ async function onEditedMessage(env, message) {
         // === 情况 B: 用户在私聊编辑 (Private -> Group) ===
         // 关键点：用户发到群里的消息是 forwardMessage，原生转发不支持编辑！
         // 解决方案：删除群里的旧消息 -> 重新转发新消息
-        
+
         // 1. 查出对应的旧群组消息 ID 和 发送类型
         const mapping = await DB.get(env.D1, 'SELECT group_message_id, sender_type FROM message_mappings WHERE private_chat_id = ? AND private_message_id = ?', [chatId, messageId]);
-        
+
         if (mapping) {
             if (mapping.sender_type === 'user') {
                 // ---> 如果是用户发送的 (sender_type='user')，说明是转发消息，必须“删旧发新”
-                
+
                 // 1. 获取 Topic ID
                 const topicId = await getExistingTopicId(env.D1, chatId);
                 if (topicId) {
                     // 2. 删除群里旧的那条转发
                     await deleteMessage(GROUP_ID, mapping.group_message_id);
-                    
+
                     // 3. 从数据库移除旧的映射 (防止堆积垃圾数据)
                     await DB.run(env.D1, 'DELETE FROM message_mappings WHERE group_message_id = ?', [mapping.group_message_id]);
 
@@ -1241,51 +1255,44 @@ function getMediaInput(message, caption) {
 }
 
 // --- 3. Verification Generation (Mini App + Turnstile) ---
-async function handleVerification(d1, chatId, messageIdToEdit = null, prefixText = '') {
-    console.log(`[handleVerification] Starting for chatId=${chatId}, WORKER_URL=${WORKER_URL}`);
+// 修复：恢复 DB 同步写入，防止用户点击过快导致数据库还没存入 Token
+async function handleVerification(d1, chatId, messageIdToEdit = null, prefixText = '', userState = null) {
+    console.log(`[handleVerification] Starting for chatId=${chatId}`);
     
-    // 检查 WORKER_URL 是否已设置
     if (!WORKER_URL) {
-        console.error('[handleVerification] WORKER_URL is not set, cannot generate verification button');
-        await sendMessageToUser(chatId, `${prefixText}⚠️ 系统配置错误，请稍后重试或联系管理员。`);
+        await sendMessageToUser(chatId, `${prefixText}⚠️ 系统配置错误。`);
         return;
     }
 
-    // 1. 生成验证 Token (用于防止伪造请求)
+    if (!userState) {
+        userState = await getUserState(d1, chatId);
+    }
+
+    // 1. 生成验证 Token
     const token = generateVerifyToken(chatId);
     const nowSec = Math.floor(Date.now() / 1000);
-    const tokenExpiry = nowSec + 180; // Token 3分钟有效
-    console.log(`[handleVerification] Generated token=${token}, expiry=${tokenExpiry} (180s)`);
+    const tokenExpiry = nowSec + 180; // 3分钟
 
-    // 2. 更新用户状态
-    let userState = await getUserState(d1, chatId);
+    // 2. 更新内存对象
     userState.verification_code = token;
     userState.code_expiry = tokenExpiry;
     userState.is_verifying = true;
     userStateCache.set(chatId, userState);
 
-    // 3. 数据库后台更新
-    const dbUpdatePromise = DB.run(d1,
+    // 3. 数据库同步更新 (关键修复：必须 await，确保数据落地)
+    await DB.run(d1,
         'UPDATE user_states SET verification_code = ?, code_expiry = ?, is_verifying = TRUE WHERE chat_id = ?',
         [token, tokenExpiry, chatId]);
-    
-    if (CTX) CTX.waitUntil(dbUpdatePromise);
 
-    // 4. 构建验证页面 URL (自动从请求中获取)
+    // 4. 构建 URL 并发送消息
     const verifyUrl = `${WORKER_URL}/verify_page?chat_id=${chatId}&token=${encodeURIComponent(token)}`;
-    console.log(`[handleVerification] Generated verify URL: ${verifyUrl}`);
-
-    // 5. 使用 web_app 按钮（底部弹窗，验证后自动关闭）
-    // 即使没有在 BotFather 配置，也可以使用，只是标题栏会显示域名
+    
     const payload = {
         chat_id: chatId,
         text: `${prefixText}请在 3 分钟内点击下方按钮完成人机验证`,
         reply_markup: {
             inline_keyboard: [[
-                {
-                    text: '点击验证',
-                    web_app: { url: verifyUrl }
-                }
+                { text: '点击验证', web_app: { url: verifyUrl } }
             ]]
         }
     };
@@ -1298,31 +1305,23 @@ async function handleVerification(d1, chatId, messageIdToEdit = null, prefixText
         } else {
             res = await telegramRequest('sendMessage', payload);
         }
-        console.log(`[handleVerification] Message sent result:`, JSON.stringify(res));
     } catch (error) {
-        console.error(`[handleVerification] Failed to send verification message:`, error.message);
-        // 如果发送失败，尝试发送纯文本消息
+        console.error(`[handleVerification] Send failed:`, error.message);
         try {
-            res = await sendMessageToUser(chatId, `${prefixText}🛡️ 请点击以下链接完成人机验证：\n${verifyUrl}`);
-            console.log(`[handleVerification] Plain text message sent:`, JSON.stringify(res));
-        } catch (fallbackError) {
-            console.error(`[handleVerification] Plain text also failed:`, fallbackError.message);
-        }
+           await sendMessageToUser(chatId, `${prefixText}验证链接：\n${verifyUrl}`);
+        } catch(e) {}
     }
 
-    // 6. 保存消息 ID
-    if (res && res.ok && res.result) {
-        const verifyMsgId = res.result.message_id;
-        console.log(`[handleVerification] Saving message ID: ${verifyMsgId}`);
-        
-        if (!messageIdToEdit) {
-            const saveIdPromise = DB.run(d1,
-                'UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?',
-                [verifyMsgId.toString(), chatId]);
-            if (CTX) CTX.waitUntil(saveIdPromise);
-        }
-    } else {
-        console.error(`[handleVerification] No valid response to save message ID, res=`, JSON.stringify(res));
+    // 5. 保存消息 ID (这个可以异步，因为不影响验证流程)
+    if (res && res.ok && res.result && !messageIdToEdit) {
+        const verifyMsgId = res.result.message_id.toString();
+        userState.last_verification_message_id = verifyMsgId;
+        userStateCache.set(chatId, userState);
+
+        const saveIdPromise = DB.run(d1,
+            'UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?',
+            [verifyMsgId, chatId]);
+        if (CTX) CTX.waitUntil(saveIdPromise);
     }
 }
 
@@ -1333,53 +1332,112 @@ function generateVerifyToken(chatId) {
     return `${chatId}_${timestamp}_${random}`;
 }
 
-// 渲染验证页面 (Mini App HTML) - 优化版本
-function renderVerifyPage(env, chatId, token) {
+// 渲染验证页面 (Mini App HTML)
+async function renderVerifyPage(env, chatId, token) {
     const turnstileSiteKey = env.TURNSTILE_SITE_KEY || '1x00000000000000000000AA';
     
-    // 极简优化版 HTML - 减少体积，加快加载
+    // 1. 预检查
+    let isExpired = false;
+    let userState = null;
+    
+    try {
+        userState = await getUserState(env.D1, chatId);
+        const nowSec = Math.floor(Date.now() / 1000);
+        
+        if (!userState.verification_code || userState.verification_code !== token || (userState.code_expiry && nowSec > userState.code_expiry)) {
+            isExpired = true;
+        }
+    } catch (e) {
+        console.error('Pre-check failed:', e);
+    }
+
+    // 2. 如果已过期：前端强制销毁
+    if (isExpired) {
+        // A. 后台：异步立刻删按钮 (不阻塞)
+        if (userState && userState.last_verification_message_id) {
+            const editPromise = telegramRequest('editMessageText', {
+                chat_id: chatId,
+                message_id: userState.last_verification_message_id,
+                text: "⏰ 验证已超时，请重新发送消息。",
+                reply_markup: { inline_keyboard: [] } 
+            }).catch(() => {});
+            
+            if (CTX) CTX.waitUntil(editPromise);
+        }
+
+        // B. 前端：引入SDK -> 初始化 -> 强制关闭 (加了双重保险)
+        return new Response(
+            `<!DOCTYPE html>
+            <html>
+            <head>
+                <script src="https://telegram.org/js/telegram-web-app.js"></script>
+            </head>
+            <body style="background:transparent;">
+                <script>
+                    // 确保对象存在
+                    var tg = window.Telegram.WebApp;
+                    tg.ready();
+                    
+                    // 策略1: 立即关闭
+                    tg.close();
+                    
+                    // 策略2: 延迟50ms再次关闭 (防止SDK未完全就绪)
+                    setTimeout(function() { tg.close(); }, 50);
+                    
+                    // 策略3: 延迟200ms再次关闭 (最后一道保险)
+                    setTimeout(function() { tg.close(); }, 200);
+                </script>
+            </body>
+            </html>`, 
+            { headers: { 'Content-Type': 'text/html' } }
+        );
+    }
+
+    // 3. Token 有效：渲染验证页 (保持不变)
     const html = `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
-<title>验证</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onLoad" async></script>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,-apple-system,sans-serif;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
-.c{text-align:center;width:100%;max-width:320px}
-.i{font-size:48px;margin-bottom:12px}
-h3{font-size:18px;margin-bottom:8px;font-weight:500}
-.d{color:var(--tg-theme-hint-color,#888);font-size:14px;margin-bottom:20px}
-#t{display:flex;justify-content:center;min-height:65px}
-#s{padding:12px 20px;border-radius:8px;font-size:14px;margin-top:16px;display:none}
-.l{display:block;background:var(--tg-theme-secondary-bg-color,#f0f0f0)}
-.ok{display:block;background:#d4edda;color:#155724}
-.er{display:block;background:#f8d7da;color:#721c24}
+body{display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#fff}
 </style>
 </head>
 <body>
-<div class="c">
-<div class="i">🛡️</div>
-<h3>安全验证</h3>
-<div class="d">请完成验证</div>
 <div id="t"></div>
-<div id="s"></div>
-</div>
 <script>
 const tg=window.Telegram.WebApp;tg.ready();tg.expand();
 const C='${chatId}',T='${token}',K='${turnstileSiteKey}';
-function onLoad(){turnstile.render('#t',{sitekey:K,callback:V,theme:'auto'})}
-async function V(t){
-const s=document.getElementById('s');s.className='l';s.textContent='验证中...';
-try{
-const r=await fetch('/verify_submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:C,token:T,turnstile_token:t})});
-const d=await r.json();
-if(d.success){s.className='ok';s.textContent='✅ 验证成功';setTimeout(()=>tg.close(),500)}
-else{s.className='er';s.textContent='❌ '+(d.error||'失败');turnstile.reset()}
-}catch(e){s.className='er';s.textContent='❌ 网络错误';turnstile.reset()}
+
+function onLoad(){
+    turnstile.render('#t',{
+        sitekey: K,
+        theme: 'light',
+        callback: async function(token) {
+            try {
+                const req = await fetch('/verify_submit',{
+                    method:'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({chat_id:C,token:T,turnstile_token:token})
+                });
+                const res = await req.json();
+                
+                if (res.success) {
+                    tg.close();
+                } else {
+                    if (res.is_fatal) {
+                        tg.close();
+                    } else {
+                        turnstile.reset();
+                    }
+                }
+            } catch(e) {
+                turnstile.reset();
+            }
+        }
+    });
 }
 </script>
 </body>
@@ -1395,52 +1453,88 @@ async function handleVerifySubmit(env, request) {
     try {
         const body = await request.json();
         const { chat_id, token, turnstile_token } = body;
-        
+
         if (!chat_id || !token || !turnstile_token) {
             return jsonResponse({ success: false, error: '参数不完整' });
         }
-        
+
         // 1. 验证 Token 是否有效
         const userState = await getUserState(env.D1, chat_id);
         const nowSec = Math.floor(Date.now() / 1000);
-        
-        if (!userState.verification_code || userState.verification_code !== token) {
-            return jsonResponse({ success: false, error: '验证链接已失效' });
+
+        const isExpired = (userState.code_expiry && nowSec > userState.code_expiry);
+        const isInvalidToken = (!userState.verification_code || userState.verification_code !== token);
+
+        if (isInvalidToken || isExpired) {
+            // A. 如果是过期的，执行惩罚逻辑
+            if (isExpired) {
+                // 计算惩罚时间 (翻倍机制)
+                const attempts = (userState.verification_attempts || 0) + 1;
+                const cooldownSeconds = Math.min(30 * Math.pow(2, attempts - 1), 300); // 最多5分钟
+                const cooldownExpiry = nowSec + cooldownSeconds;
+
+                // 更新数据库：清空验证码，设置冷却时间
+                await DB.run(env.D1,
+                    'UPDATE user_states SET verification_code = NULL, is_verifying = FALSE, code_expiry = ?, verification_attempts = ? WHERE chat_id = ?',
+                    [cooldownExpiry, attempts, chat_id]
+                );
+                userStateCache.delete(chat_id); // 清缓存
+
+                // B. 编辑旧消息，提示已过期
+                if (userState.last_verification_message_id) {
+                    try {
+                        await telegramRequest('editMessageText', {
+                            chat_id: chat_id,
+                            message_id: userState.last_verification_message_id,
+                            text: `⏰ <b>验证已超时</b>\n\n您未在规定时间内完成验证。请等待 ${cooldownSeconds} 秒后重新发送消息触发验证。`,
+                            parse_mode: 'HTML'
+                        });
+                    } catch (e) { }
+                }
+
+                return jsonResponse({
+                    success: false,
+                    error: `验证已超时，请等待 ${cooldownSeconds} 秒`,
+                    is_fatal: true // <--- 告诉前端强制退出
+                });
+            } else {
+                return jsonResponse({
+                    success: false,
+                    error: '验证链接已失效',
+                    is_fatal: true // <--- 告诉前端强制退出
+                });
+            }
         }
-        
-        if (userState.code_expiry && nowSec > userState.code_expiry) {
-            return jsonResponse({ success: false, error: '验证已过期，请重新获取' });
-        }
-        
+
         // 2. 验证 Turnstile Token
         const turnstileSecret = env.TURNSTILE_SECRET_KEY || '1x0000000000000000000000000000000AA'; // 测试 secret
         const turnstileResult = await verifyTurnstile(turnstile_token, turnstileSecret);
-        
+
         if (!turnstileResult.success) {
             return jsonResponse({ success: false, error: '人机验证失败' });
         }
-        
+
         // 3. 验证成功，更新用户状态
         const verifiedExpiry = nowSec + (7 * 24 * 3600); // 7天有效
-        
+
         await DB.run(env.D1,
             `UPDATE user_states SET is_verified = TRUE, verified_expiry = ?, verification_code = NULL,
              code_expiry = NULL, is_verifying = FALSE, is_first_verification = FALSE, verification_attempts = 0
              WHERE chat_id = ?`,
             [verifiedExpiry, chat_id]
         );
-        
+
         // 清除缓存（因为 Workers 请求间缓存不共享，这里的 set 没意义，但删除可以确保下次从 DB 读取）
         userStateCache.delete(chat_id);
-        
+
         // 重置消息速率
         await DB.run(env.D1, 'UPDATE message_rates SET message_count = 0 WHERE chat_id = ?', [chat_id]);
         messageRateCache.delete(chat_id);
-        
+
         // 4. 发送验证成功消息（使用缓存的远程消息）
         const successMsg = await getVerificationSuccessMessage(env.D1);
         await sendMessageToUser(chat_id, successMsg, { disable_web_page_preview: true });
-        
+
         // 5. 确保用户话题存在（后台执行，不阻塞响应）
         const info = await getUserInfo(chat_id);
         if (CTX) {
@@ -1448,14 +1542,14 @@ async function handleVerifySubmit(env, request) {
         } else {
             await ensureUserTopic(env.D1, chat_id, info);
         }
-        
+
         // 6. 删除验证消息
         if (userState.last_verification_message_id) {
             await deleteMessage(chat_id, userState.last_verification_message_id);
         }
-        
+
         return jsonResponse({ success: true });
-        
+
     } catch (error) {
         console.error('Verify submit error:', error);
         return jsonResponse({ success: false, error: '服务器错误' });
@@ -1496,36 +1590,156 @@ async function deleteMessage(chatId, messageId) {
     } catch (e) { /* Ignore delete errors (msg might not exist) */ }
 }
 
+// --- 双向同步删除 (支持相册秒删) ---
 async function handleSyncedDelete(d1, groupMsgId, commandMsgId, commandChatId = GROUP_ID) {
-    // Delete Private Msg
-    const mapping = await DB.get(d1, 'SELECT private_chat_id, private_message_id FROM message_mappings WHERE group_message_id = ?', [groupMsgId]);
-    if (mapping) {
-        await deleteMessage(mapping.private_chat_id, mapping.private_message_id);
-        await DB.run(d1, 'DELETE FROM message_mappings WHERE group_message_id = ?', [groupMsgId]);
+    // 1. 查询当前消息的映射信息
+    const target = await DB.get(d1, 'SELECT private_chat_id, private_message_id, media_group_id FROM message_mappings WHERE group_message_id = ?', [groupMsgId]);
+
+    // 使用 Set 自动去重
+    const groupIds = new Set([parseInt(groupMsgId)]);
+    const privateIds = new Set();
+    let privateChatId = null;
+
+    if (target) {
+        privateChatId = target.private_chat_id;
+        // 把当前这条的私聊ID加进去
+        if (target.private_message_id) privateIds.add(parseInt(target.private_message_id));
+
+        // 2. 关键点：如果是相册 (Media Group)，把同组的所有 ID 都查出来
+        if (target.media_group_id) {
+            const siblings = await DB.all(d1,
+                'SELECT group_message_id, private_message_id FROM message_mappings WHERE media_group_id = ?',
+                [target.media_group_id]
+            );
+
+            if (siblings && siblings.results) {
+                for (const row of siblings.results) {
+                    groupIds.add(parseInt(row.group_message_id));
+                    privateIds.add(parseInt(row.private_message_id));
+                }
+            }
+        }
     }
-    // Delete Group Msg
-    await deleteMessage(GROUP_ID, groupMsgId);
-    // Delete Command Msg
-    if (commandMsgId) await deleteMessage(commandChatId, commandMsgId);
+
+    // 转为数组供 API 使用
+    const groupIdsArr = Array.from(groupIds);
+    const privateIdsArr = Array.from(privateIds);
+
+    // 3. 并行执行删除请求 (速度最快)
+    const tasks = [];
+
+    // A. 删群消息 (使用批量接口)
+    if (groupIdsArr.length > 0) {
+        // 复用之前写好的 deleteMessagesBatch，一次请求删多条
+        tasks.push(deleteMessagesBatch(GROUP_ID, groupIdsArr));
+    }
+
+    // B. 删私聊消息 (使用批量接口)
+    if (privateChatId && privateIdsArr.length > 0) {
+        tasks.push(deleteMessagesBatch(privateChatId, privateIdsArr));
+    }
+
+    // C. 删指令消息 (例如用户的 /delete)
+    if (commandMsgId) {
+        tasks.push(deleteMessage(commandChatId, commandMsgId));
+    }
+
+    // 等待所有删除请求发送完毕
+    await Promise.all(tasks);
+
+    // 4. 一次性清理数据库映射
+    if (groupIdsArr.length > 0) {
+        const ph = groupIdsArr.map(() => '?').join(',');
+        await DB.run(d1, `DELETE FROM message_mappings WHERE group_message_id IN (${ph})`, groupIdsArr);
+    }
 }
 
 async function handleBatchDelete(d1, privateChatId, count, senderType) {
-    const rows = await DB.all(d1, 
-        'SELECT group_message_id, private_message_id FROM message_mappings WHERE private_chat_id = ? AND sender_type = ? ORDER BY created_at DESC LIMIT ?', 
+    // 1. 获取需要删除的消息记录 (包含 media_group_id)
+    const rows = await DB.all(d1,
+        'SELECT group_message_id, private_message_id, media_group_id FROM message_mappings WHERE private_chat_id = ? AND sender_type = ? ORDER BY created_at DESC LIMIT ?',
         [privateChatId, senderType, count]
     );
-    if (!rows.results.length) return;
 
-    const groupIds = [];
+    if (!rows.results || rows.results.length === 0) return;
+
+    // 2. 智能补全相册 (如果删到了相册的一部分，把剩下的也找出来)
+    const messagesToDelete = new Map();
+    const mediaGroupIds = new Set();
+
     for (const row of rows.results) {
-        groupIds.push(row.group_message_id);
-        await deleteMessage(GROUP_ID, row.group_message_id);
-        await deleteMessage(privateChatId, row.private_message_id);
+        messagesToDelete.set(row.group_message_id, row);
+        if (row.media_group_id) mediaGroupIds.add(row.media_group_id);
     }
-    if (groupIds.length) {
-        const ph = groupIds.map(() => '?').join(',');
-        await DB.run(d1, `DELETE FROM message_mappings WHERE group_message_id IN (${ph})`, groupIds);
+
+    if (mediaGroupIds.size > 0) {
+        const ids = Array.from(mediaGroupIds);
+        const placeholders = ids.map(() => '?').join(',');
+        const siblings = await DB.all(d1,
+            `SELECT group_message_id, private_message_id FROM message_mappings WHERE media_group_id IN (${placeholders})`,
+            ids
+        );
+        if (siblings.results) {
+            for (const row of siblings.results) {
+                messagesToDelete.set(row.group_message_id, row);
+            }
+        }
     }
+
+    // 3. 分类收集 ID
+    const groupMsgIds = [];
+    const privateMsgIds = [];
+
+    for (const msg of messagesToDelete.values()) {
+        groupMsgIds.push(parseInt(msg.group_message_id));
+        privateMsgIds.push(parseInt(msg.private_message_id));
+    }
+
+    // 4. 并行执行批量删除 (核心优化点)
+    // 使用 Promise.all 让群组删除和私聊删除同时发生
+    const tasks = [];
+
+    if (groupMsgIds.length > 0) {
+        tasks.push(deleteMessagesBatch(GROUP_ID, groupMsgIds));
+    }
+
+    // 注意：Bot 只能批量删除它自己发送的消息。
+    // 如果 senderType 是 'user' (用户发给Bot的)，Bot 无法在私聊里删除用户的消息，这里会报错或忽略，
+    // 但为了逻辑统一，我们还是尝试调用，Telegram 会自动忽略删不掉的消息。
+    if (privateMsgIds.length > 0) {
+        tasks.push(deleteMessagesBatch(privateChatId, privateMsgIds));
+    }
+
+    // 所有的网络请求同时发出去，速度最快
+    await Promise.all(tasks);
+
+    // 5. 批量清理数据库
+    if (groupMsgIds.length > 0) {
+        // 构建 DELETE IN (...) 语句
+        const ph = groupMsgIds.map(() => '?').join(',');
+        await DB.run(d1, `DELETE FROM message_mappings WHERE group_message_id IN (${ph})`, groupMsgIds);
+    }
+}
+
+// --- 批量删除辅助函数 (优化速度核心) ---
+async function deleteMessagesBatch(chatId, messageIds) {
+    if (!messageIds || messageIds.length === 0) return;
+
+    // Telegram API 限制每次最多删 100 条
+    const chunkSize = 100;
+    const promises = [];
+
+    for (let i = 0; i < messageIds.length; i += chunkSize) {
+        const chunk = messageIds.slice(i, i + chunkSize);
+        // 并行发送请求，不用 await 阻塞循环
+        promises.push(telegramRequest('deleteMessages', {
+            chat_id: chatId,
+            message_ids: chunk
+        }));
+    }
+
+    // 等待所有批次请求完成
+    await Promise.all(promises);
 }
 
 // --- 5. State & Settings Accessors  ---
