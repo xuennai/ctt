@@ -22,7 +22,7 @@
   
 3. **高效的用户验证机制**  
    - 支持按钮式 CF 人机验证，有惩罚机制，防止机器人刷消息。
-   - 验证状态持久化（3分钟有效期），用户验证通过后无需重复验证，除非触发频率限制。
+   - 验证状态持久化，用户验证通过后短时间内无需重复验证，除非被拉黑或被管理员删除信息。
    - 删除聊天记录后重新开始，验证码会自动触发，确保用户体验流畅。
 
 4. **消息频率限制（防刷保护）**  
@@ -41,33 +41,34 @@
 
 ### 准备工作
 1. **创建Telegram Bot**：
-   - 在Telegram中找到`@BotFather`。
-   - 现在 BotFather 支持小程序图形化操作，优先使用小程序。
-   - 发送`/newbot`创建新机器人，按照提示设置机器人名称和用户名，获取Bot Token（例如`123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`）。
-   - 发送`/setinline`切换内联模式。
+   - 在Telegram中找到`@BotFather`
+   - 现在 BotFather 支持小程序图形化操作，优先使用小程序
+   - 发送`/newbot`创建新机器人，按照提示设置机器人名称和用户名，获取Bot Token（例如`123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`）
+   - 发送`/setinline`切换内联模式
 
 2. **创建后台群组**：
-   - 创建一个Telegram群组（按需设置是否公开），
-   - 群组的“话题功能”打开。
+   - 创建一个Telegram群组（按需设置是否公开）
+   - 群组的“话题功能”打开
    - 添加机器人为管理员，建议权限全给（消息管理，话题管理）
-   - 获取群组的Chat ID（例如`-100123456789`），可以通过`@getidsbot`获取（拉它进群）。
+   - 获取群组的Chat ID（例如`-100123456789`），可以通过`@getidsbot`获取（拉它进群）
 
 ### 部署到Cloudflare Workers
 
 #### 步骤 1：创建D1 SQL数据库
-1. 登录[Cloudflare仪表板](https://dash.cloudflare.com/)。
-2. 导航到 **存储和数据库 > D1 SQL数据库**，输入一个名称（例如`cfteletrans-db`），点击 **创建**。
+1. 登录[Cloudflare仪表板](https://dash.cloudflare.com/)
+2. 导航到 **存储和数据库 > D1 SQL数据库**，输入一个名称（例如`cfteletrans-db`），点击 **创建**
 
-#### 步骤 2：创建Workers项目
-1. 登录[Cloudflare仪表板](https://dash.cloudflare.com/)。
-2. 导航到 **Workers和Pages > Workers和Pages**，点击 **创建**。
+#### 步骤 2：获取Turnstile密钥 ####
+1. 登录[Cloudflare仪表板](https://dash.cloudflare.com/)
+2. 导航到 **应用程序安全 > Turnstile**，点击 **添加小组件**
+3. 点击 **添加主机名**，填写你的Worker域名（例如 xxx.workers.dev）
+4. 小组件名称随意，其他无特殊需求默认即可
+5. 点击 **创建**，复制获取的站点密钥（Site Key）和 密钥（Secret Key）
+   
+#### 步骤 3：创建Workers项目
+1. 登录[Cloudflare仪表板](https://dash.cloudflare.com/)
+2. 导航到 **计算和AI > Workers和Pages > Workers和Pages**，点击 **创建**
 3. 点击 **Hello world**，输入一个名称（例如`cfteletrans`），再点击 **部署**
-
-#### 步骤 3：获取 Turnstile 密钥 ####
-1. 登录[Cloudflare仪表板](https://dash.cloudflare.com/)。
-2. 点击左侧 应用程序安全 进入 Turnstile 页面
-3. 名称随意，添加主机名，填写你的 Worker 域名（例如 xxx.workers.dev）
-4. 创建新站点，获取 Site Key 和 Secret Key
 
 #### 步骤 4：配置环境变量
 1. 在创建的Workers项目 **设置 > 变量和机密** 中，添加以下变量：
@@ -90,17 +91,17 @@
 3. 完成验证，确认收到合并消息。
 4. 发送消息，确认消息转发到后台群组的子论坛。
 
-### 📌 迁移/升级提示
-**如果是从原项目迁移过来，且没有删除重建数据库**，建议在浏览器中依次访问以下链接以完成配置更新：
+### 迁移/升级提示
+**如果是因为从原项目迁移过来，且没有删除重建数据库而出现问题**，建议在浏览器中依次访问以下链接以完成配置更新：
 
 1. **注册 Webhook**
-   `https://xxx.xxx.workers.dev/registerWebhook`
+   `https://xx.xxx.workers.dev/registerWebhook`
 2. **检查数据表**
-   `https://你的域名/checkTables`
+   `https://xx.xxx.workers.dev/checkTables`
 3. **检查 Webhook 状态**
    `https://api.telegram.org/bot{你的BOT_TOKEN}/getWebhookInfo`
-> **📝 注意：** 请使用你自己的 Workers URL 和 Bot Token 替换上述链接中的占位符。
-> * 特别注意 Telegram API 链接中的 `bot` 字符不要删除，直接在后面跟上你的 Token。
+> **注意：** 请使用你自己的 Workers URL 和 Bot Token 替换上述链接中的占位符。
+> * 特别注意 Telegram API 链接中的 `bot` 字符串不要删除，直接在后面跟上你的 Token。
 
 ## 需要在 Cloudflare 绑定的变量表
 
